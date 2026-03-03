@@ -222,13 +222,14 @@ pub const Config = struct {
         }
         const allocator = arena_ptr.allocator();
 
-        const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
-
         // NULLCLAW_HOME overrides the default config directory (~/.nullclaw/).
-        const config_dir = if (std.posix.getenv("NULLCLAW_HOME")) |env_home|
-            try allocator.dupe(u8, env_home)
-        else
-            try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+        const config_dir = std.process.getEnvVarOwned(allocator, "NULLCLAW_HOME") catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => blk: {
+                const home = platform.getHomeDir(allocator) catch return error.NoHomeDir;
+                break :blk try std.fs.path.join(allocator, &.{ home, ".nullclaw" });
+            },
+            else => return err,
+        };
         const config_path = try std.fs.path.join(allocator, &.{ config_dir, "config.json" });
         const default_workspace_dir = try std.fs.path.join(allocator, &.{ config_dir, "workspace" });
 
