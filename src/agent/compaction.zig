@@ -308,6 +308,13 @@ fn summarizeSlice(
         if (summary_resp.content) |c| {
             if (c.len > 0) allocator.free(c);
         }
+        for (summary_resp.tool_calls) |tc| {
+            if (tc.id.len > 0) allocator.free(tc.id);
+            if (tc.name.len > 0) allocator.free(tc.name);
+            if (tc.arguments.len > 0) allocator.free(tc.arguments);
+        }
+        if (summary_resp.tool_calls.len > 0) allocator.free(summary_resp.tool_calls);
+        if (summary_resp.provider.len > 0) allocator.free(summary_resp.provider);
         if (summary_resp.model.len > 0) allocator.free(summary_resp.model);
         if (summary_resp.reasoning_content) |rc| {
             if (rc.len > 0) allocator.free(rc);

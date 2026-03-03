@@ -30,14 +30,56 @@ fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
     return false;
 }
 
-fn providerRequiresApiKey(provider_name: []const u8) bool {
+fn isLocalEndpoint(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "http://localhost") or
+        std.mem.startsWith(u8, url, "https://localhost") or
+        std.mem.startsWith(u8, url, "http://127.") or
+        std.mem.startsWith(u8, url, "https://127.") or
+        std.mem.startsWith(u8, url, "http://0.0.0.0") or
+        std.mem.startsWith(u8, url, "https://0.0.0.0") or
+        std.mem.startsWith(u8, url, "http://[::1]") or
+        std.mem.startsWith(u8, url, "https://[::1]");
+}
+
+fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool {
     return switch (providers.classifyProvider(provider_name)) {
         .ollama_provider, .claude_cli_provider, .codex_cli_provider, .openai_codex_provider => false,
+        .compatible_provider => blk: {
+            if (base_url) |configured| {
+                break :blk !isLocalEndpoint(configured);
+            }
+            if (std.mem.startsWith(u8, provider_name, "custom:")) {
+                break :blk !isLocalEndpoint(provider_name["custom:".len..]);
+            }
+            if (providers.compatibleProviderUrl(provider_name)) |known_url| {
+                break :blk !isLocalEndpoint(known_url);
+            }
+            break :blk true;
+        },
+        .unknown => blk: {
+            if (base_url) |configured| break :blk !isLocalEndpoint(configured);
+            break :blk true;
+        },
         else => true,
     };
 }
 
+fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+    var child = std.process.Child.init(argv, allocator);
+    child.stdin_behavior = .Ignore;
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+    try child.spawn();
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CliProcessFailed,
+        else => return error.CliProcessFailed,
+    }
+}
+
 fn classifyProbeError(err: anyerror) struct { reason: []const u8, status_code: ?u16 } {
+    if (err == error.FileNotFound) return .{ .reason = "component_binary_missing", .status_code = 404 };
+    if (err == error.CliProcessFailed) return .{ .reason = "component_probe_failed", .status_code = null };
     if (err == error.RateLimited) return .{ .reason = "rate_limited", .status_code = 429 };
     if (err == error.ApiError or err == error.ProviderError) {
         return .{ .reason = "provider_rejected", .status_code = null };
@@ -61,6 +103,38 @@ fn classifyProbeError(err: anyerror) struct { reason: []const u8, status_code: ?
         return .{ .reason = "provider_unavailable", .status_code = 503 };
     }
     return .{ .reason = "auth_check_failed", .status_code = null };
+}
+
+fn probeCliProvider(
+    allocator: std.mem.Allocator,
+    kind: providers.ProviderKind,
+    provider: []const u8,
+    model: []const u8,
+) ProbeResult {
+    const argv = switch (kind) {
+        .claude_cli_provider => &[_][]const u8{ "claude", "--version" },
+        .codex_cli_provider => &[_][]const u8{ "codex", "--version" },
+        else => unreachable,
+    };
+
+    runCommandProbe(allocator, argv) catch |err| {
+        const classified = classifyProbeError(err);
+        return .{
+            .provider = provider,
+            .model = model,
+            .live_ok = false,
+            .reason = classified.reason,
+            .status_code = classified.status_code,
+        };
+    };
+
+    return .{
+        .provider = provider,
+        .model = model,
+        .live_ok = true,
+        .reason = "ok",
+        .status_code = 200,
+    };
 }
 
 fn writeProbeResult(result: ProbeResult) !void {
@@ -166,8 +240,10 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         break :blk onboard.defaultModelForProvider(provider);
     };
 
+    const provider_kind = providers.classifyProvider(provider);
+    const provider_base_url = cfg.getProviderBaseUrl(provider);
     const api_key = cfg.getProviderKey(provider);
-    if (providerRequiresApiKey(provider)) {
+    if (providerRequiresApiKey(provider, provider_base_url)) {
         const key = api_key orelse "";
         if (key.len == 0) {
             try writeProbeResult(.{
@@ -180,11 +256,16 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
         }
     }
 
+    if (provider_kind == .claude_cli_provider or provider_kind == .codex_cli_provider) {
+        try writeProbeResult(probeCliProvider(allocator, provider_kind, provider, model));
+        return;
+    }
+
     var holder = providers.ProviderHolder.fromConfig(
         allocator,
         provider,
         api_key,
-        cfg.getProviderBaseUrl(provider),
+        provider_base_url,
         cfg.getProviderNativeTools(provider),
         cfg.getProviderUserAgent(provider),
     );
@@ -226,13 +307,22 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 test "providerRequiresApiKey marks local providers as keyless" {
-    try std.testing.expect(!providerRequiresApiKey("ollama"));
-    try std.testing.expect(!providerRequiresApiKey("claude-cli"));
-    try std.testing.expect(providerRequiresApiKey("openai"));
+    try std.testing.expect(!providerRequiresApiKey("ollama", null));
+    try std.testing.expect(!providerRequiresApiKey("claude-cli", null));
+    try std.testing.expect(providerRequiresApiKey("openai", null));
+    try std.testing.expect(!providerRequiresApiKey("lmstudio", null));
+    try std.testing.expect(!providerRequiresApiKey("custom:http://127.0.0.1:8080/v1", null));
+    try std.testing.expect(providerRequiresApiKey("custom:https://example.com/v1", null));
 }
 
 test "classifyProbeError maps rate limits" {
     const classified = classifyProbeError(error.RateLimited);
     try std.testing.expectEqualStrings("rate_limited", classified.reason);
     try std.testing.expectEqual(@as(?u16, 429), classified.status_code);
+}
+
+test "classifyProbeError maps missing binary" {
+    const classified = classifyProbeError(error.FileNotFound);
+    try std.testing.expectEqualStrings("component_binary_missing", classified.reason);
+    try std.testing.expectEqual(@as(?u16, 404), classified.status_code);
 }
