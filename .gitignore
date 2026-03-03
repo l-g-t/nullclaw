@@ -18,3 +18,10 @@ result
 .direnv/
 .worktrees
 config.signal.json
+
+# IDE configurations
+.idea/
+.vscode/
+.cursor/
+.trae/
+.codebuddy/
