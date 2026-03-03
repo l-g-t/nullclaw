@@ -185,6 +185,8 @@ pub const ChatResponse = struct {
     content: ?[]const u8 = null,
     tool_calls: []const ToolCall = &.{},
     usage: TokenUsage = .{},
+    /// Effective provider that produced this response (set by wrappers such as ReliableProvider).
+    provider: []const u8 = "",
     model: []const u8 = "",
     /// Optional reasoning/thinking content from models that support it (e.g. Claude extended thinking).
     reasoning_content: ?[]const u8 = null,
@@ -417,13 +419,42 @@ pub const Provider = struct {
             return f(self.ptr, allocator, request, model, temperature, callback, callback_ctx);
         }
         // Fallback: blocking chat() → single chunk + final
-        const response = try self.chat(allocator, request, model, temperature);
+        var response = try self.chat(allocator, request, model, temperature);
+        errdefer {
+            if (response.content) |content| {
+                if (content.len > 0) allocator.free(content);
+            }
+            for (response.tool_calls) |tc| {
+                if (tc.id.len > 0) allocator.free(tc.id);
+                if (tc.name.len > 0) allocator.free(tc.name);
+                if (tc.arguments.len > 0) allocator.free(tc.arguments);
+            }
+            if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
+            if (response.provider.len > 0) allocator.free(response.provider);
+            if (response.model.len > 0) allocator.free(response.model);
+            if (response.reasoning_content) |rc| {
+                if (rc.len > 0) allocator.free(rc);
+            }
+        }
         if (response.content) |content| {
             if (content.len > 0) {
                 callback(callback_ctx, StreamChunk.textDelta(content));
             }
         }
         callback(callback_ctx, StreamChunk.finalChunk());
+        for (response.tool_calls) |tc| {
+            if (tc.id.len > 0) allocator.free(tc.id);
+            if (tc.name.len > 0) allocator.free(tc.name);
+            if (tc.arguments.len > 0) allocator.free(tc.arguments);
+        }
+        if (response.tool_calls.len > 0) allocator.free(response.tool_calls);
+        if (response.provider.len > 0) allocator.free(response.provider);
+        if (response.reasoning_content) |rc| {
+            if (rc.len > 0) allocator.free(rc);
+        }
+        response.tool_calls = &.{};
+        response.provider = "";
+        response.reasoning_content = null;
         return .{
             .content = response.content,
             .usage = response.usage,

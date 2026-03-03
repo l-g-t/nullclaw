@@ -210,6 +210,16 @@ pub const Agent = struct {
         }
     };
 
+    pub const UsageRecord = struct {
+        ts: i64,
+        provider: []const u8,
+        model: []const u8,
+        usage: providers.TokenUsage,
+        success: bool,
+    };
+
+    pub const UsageRecordCallback = *const fn (ctx: *anyopaque, record: UsageRecord) void;
+
     allocator: std.mem.Allocator,
     provider: Provider,
     tools: []const Tool,
@@ -285,6 +295,10 @@ pub const Agent = struct {
     stream_callback: ?providers.StreamCallback = null,
     /// Context pointer passed to stream_callback.
     stream_ctx: ?*anyopaque = null,
+    /// Optional callback invoked for each LLM response usage record.
+    usage_record_callback: ?UsageRecordCallback = null,
+    /// Context pointer passed to usage_record_callback.
+    usage_record_ctx: ?*anyopaque = null,
     /// Conversation context for the current turn (Signal-specific for now).
     conversation_context: ?prompt.ConversationContext = null,
 
@@ -836,6 +850,7 @@ pub const Agent = struct {
                         .error_message = @errorName(err),
                     } };
                     self.observer.recordEvent(&fail_event);
+                    self.emitUsageFailure();
                     return err;
                 };
                 response = ChatResponse{
@@ -894,7 +909,10 @@ pub const Agent = struct {
                             },
                             self.model_name,
                             self.temperature,
-                        ) catch return err;
+                        ) catch |retry_after_compact_err| {
+                            self.emitUsageFailure();
+                            return retry_after_compact_err;
+                        };
                     }
 
                     // Retry once
@@ -935,8 +953,12 @@ pub const Agent = struct {
                                 },
                                 self.model_name,
                                 self.temperature,
-                            ) catch return retry_err;
+                            ) catch |retry_after_compact_err| {
+                                self.emitUsageFailure();
+                                return retry_after_compact_err;
+                            };
                         }
+                        self.emitUsageFailure();
                         return retry_err;
                     };
                 };
@@ -956,6 +978,7 @@ pub const Agent = struct {
             // Track tokens
             self.total_tokens += response.usage.total_tokens;
             self.last_turn_usage = response.usage;
+            self.emitUsageRecord(&response, true);
 
             const response_text = response.contentOrEmpty();
             const use_native = response.hasToolCalls();
@@ -1508,12 +1531,13 @@ pub const Agent = struct {
         const content = response.contentOrEmpty();
         const preview = llmLogPreview(content);
         log.info(
-            "llm response session=0x{x} iter={d} attempt={d} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
+            "llm response session=0x{x} iter={d} attempt={d} provider={s} model={s} bytes={d} tool_calls={d} usage={f} content={f}{s}",
             .{
                 session_hash,
                 iteration,
                 attempt,
-                if (response.model.len > 0) response.model else self.model_name,
+                self.effectiveProvider(response),
+                self.effectiveModel(response),
                 content.len,
                 response.tool_calls.len,
                 std.json.fmt(response.usage, .{}),
@@ -1553,6 +1577,36 @@ pub const Agent = struct {
                 },
             );
         }
+    }
+
+    fn effectiveProvider(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.provider.len > 0) return response.provider;
+        return self.provider.getName();
+    }
+
+    fn effectiveModel(self: *const Agent, response: *const ChatResponse) []const u8 {
+        if (response.model.len > 0) return response.model;
+        return self.model_name;
+    }
+
+    fn emitUsageRecord(self: *Agent, response: *const ChatResponse, success: bool) void {
+        const cb = self.usage_record_callback orelse return;
+        const ctx = self.usage_record_ctx orelse return;
+        cb(ctx, .{
+            .ts = std.time.timestamp(),
+            .provider = self.effectiveProvider(response),
+            .model = self.effectiveModel(response),
+            .usage = response.usage,
+            .success = success,
+        });
+    }
+
+    fn emitUsageFailure(self: *Agent) void {
+        const failed = ChatResponse{
+            .model = self.model_name,
+            .usage = .{},
+        };
+        self.emitUsageRecord(&failed, false);
     }
 
     /// Build provider-ready ChatMessage slice from owned history.
@@ -1635,6 +1689,7 @@ pub const Agent = struct {
             if (tc.arguments.len > 0) self.allocator.free(tc.arguments);
         }
         if (resp.tool_calls.len > 0) self.allocator.free(resp.tool_calls);
+        if (resp.provider.len > 0) self.allocator.free(resp.provider);
         if (resp.model.len > 0) self.allocator.free(resp.model);
         if (resp.reasoning_content) |rc| {
             if (rc.len > 0) self.allocator.free(rc);
@@ -1642,6 +1697,7 @@ pub const Agent = struct {
         // Mark as consumed to prevent double-free
         resp.content = null;
         resp.tool_calls = &.{};
+        resp.provider = "";
         resp.model = "";
         resp.reasoning_content = null;
     }

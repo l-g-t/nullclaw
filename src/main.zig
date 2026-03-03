@@ -90,6 +90,10 @@ pub fn main() !void {
         try yc.list_models.run(allocator, args[2..]);
         return;
     }
+    if (std.mem.eql(u8, args[1], "--probe-provider-health")) {
+        try yc.provider_probe.run(allocator, args[2..]);
+        return;
+    }
     if (std.mem.eql(u8, args[1], "--from-json")) {
         try yc.from_json.run(allocator, args[2..]);
         return;
