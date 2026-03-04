@@ -510,7 +510,6 @@ test "shell keeps subshell backticks blocked after markdown normalization" {
     defer parsed.deinit();
     const result = try st.execute(std.testing.allocator, parsed.value.object);
     defer if (result.output.len > 0) std.testing.allocator.free(result.output);
-    defer if (result.error_msg) |e| std.testing.allocator.free(e);
     try std.testing.expect(!result.success);
     try std.testing.expect(result.error_msg != null);
     try std.testing.expect(std.mem.indexOf(u8, result.error_msg.?, "Command not allowed") != null);
