@@ -460,7 +460,21 @@ pub fn allTools(
         }
     }
 
+    const mgt = try allocator.create(message.MessageTool);
+    mgt.* = .{};
+    try list.append(allocator, mgt.tool());
+
     return list.toOwnedSlice(allocator);
+}
+
+/// Bind the event bus to message tools.
+pub fn bindEventBus(tools: []const Tool, event_bus: ?*@import("../bus.zig").Bus) void {
+    for (tools) |t| {
+        if (t.vtable == &message.MessageTool.vtable) {
+            const mt: *message.MessageTool = @ptrCast(@alignCast(t.ptr));
+            mt.event_bus = event_bus;
+        }
+    }
 }
 
 /// Bind a memory backend to memory tools in a pre-built tool list.

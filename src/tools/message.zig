@@ -28,7 +28,7 @@ pub const MessageTool = struct {
         \\{"type":"object","properties":{"content":{"type":"string","minLength":1,"description":"Message text to send"},"channel":{"type":"string","description":"Target channel (telegram, discord, slack, etc.). Defaults to current."},"chat_id":{"type":"string","description":"Target chat/room ID. Defaults to current."}},"required":["content"]}
     ;
 
-    const vtable = root.ToolVTable(@This());
+    pub const vtable = root.ToolVTable(@This());
 
     pub fn tool(self: *MessageTool) Tool {
         return .{

@@ -23,6 +23,9 @@ const subagent_mod = @import("subagent.zig");
 const subagent_runner = @import("subagent_runner.zig");
 const agent_routing = @import("agent_routing.zig");
 const provider_runtime = @import("providers/runtime_bundle.zig");
+const thread_stacks = @import("thread_stacks.zig");
+const control_plane = @import("control_plane.zig");
+const bus_mod = @import("bus.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -373,7 +376,7 @@ pub const ChannelRuntime = struct {
     security_policy: *security.SecurityPolicy,
 
     /// Initialize the runtime from config — mirrors main.zig:702-786 setup.
-    pub fn init(allocator: std.mem.Allocator, config: *const Config) !*ChannelRuntime {
+    pub fn init(allocator: std.mem.Allocator, config: *const Config, event_bus: ?*bus_mod.Bus) !*ChannelRuntime {
         var runtime_provider = try provider_runtime.RuntimeProviderBundle.init(allocator, config);
         errdefer runtime_provider.deinit();
 
@@ -461,6 +464,8 @@ pub const ChannelRuntime = struct {
         errdefer allocator.destroy(noop_obs);
         noop_obs.* = .{};
         const obs = noop_obs.observer();
+
+        tools_mod.bindEventBus(tools, event_bus);
 
         // Session manager
         var session_mgr = session_mod.SessionManager.init(allocator, config, provider_i, tools, mem_opt, obs, if (mem_rt) |rt| rt.session_store else null, if (mem_rt) |*rt| rt.response_cache else null);

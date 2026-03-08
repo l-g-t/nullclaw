@@ -879,7 +879,7 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;
     if (has_runtime_dependent_channels) {
-        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
+        channel_rt = channel_loop.ChannelRuntime.init(allocator, config, &event_bus) catch |err| blk: {
             state.markError("channels", @errorName(err));
             health.markComponentError("channels", "runtime init failed");
             stdout.print(
@@ -1795,7 +1795,7 @@ test "mergeSchedulerTickChangesAndSave preserves runtime agent fields" {
 
     var runtime = CronScheduler.init(allocator, 32, true);
     defer runtime.deinit();
-    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4");
+    _ = try runtime.addAgentJob("* * * * *", "summarize merge state", "openrouter/anthropic/claude-sonnet-4", .{});
     runtime.jobs.items[runtime.jobs.items.len - 1].next_run_secs = 0;
     try cron.saveJobs(&runtime);
 
