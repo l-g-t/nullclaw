@@ -1121,6 +1121,155 @@ const ClickHouseMemoryImpl = struct {
         return std.fmt.parseInt(u64, trimmed, 10) catch null;
     }
 
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const query = try std.fmt.allocPrint(self_.allocator,
+            \\SELECT toString(count()) FROM (
+            \\    SELECT session_id
+            \\    FROM {s}.{s}
+            \\    WHERE instance_id = {{iid:String}}
+            \\    GROUP BY session_id
+            \\)
+        , .{ self_.db_q, self_.messages_table_q });
+        defer self_.allocator.free(query);
+
+        const body = try self_.executeQuery(self_.allocator, query, &.{
+            .{ "iid", self_.instance_id },
+        });
+        defer self_.allocator.free(body);
+
+        const trimmed = std.mem.trim(u8, body, " \t\n\r");
+        if (trimmed.len == 0) return 0;
+        return std.fmt.parseInt(u64, trimmed, 10) catch 0;
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        var limit_buf: [20]u8 = undefined;
+        const limit_str = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
+        var offset_buf: [20]u8 = undefined;
+        const offset_str = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+
+        const query = try std.fmt.allocPrint(allocator,
+            \\SELECT session_id, toString(count()), toString(min(created_at)), toString(max(created_at))
+            \\FROM {s}.{s}
+            \\WHERE instance_id = {{iid:String}}
+            \\GROUP BY session_id
+            \\ORDER BY max(created_at) DESC
+            \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
+        , .{ self_.db_q, self_.messages_table_q });
+        defer allocator.free(query);
+
+        const body = try self_.executeQuery(allocator, query, &.{
+            .{ "iid", self_.instance_id },
+            .{ "limit", limit_str },
+            .{ "offset", offset_str },
+        });
+        defer allocator.free(body);
+
+        const rows = try parseTsvRows(allocator, body);
+        defer freeTsvRows(allocator, rows);
+
+        var sessions = try allocator.alloc(root.SessionInfo, rows.len);
+        var filled: usize = 0;
+        errdefer {
+            for (sessions[0..filled]) |info| info.deinit(allocator);
+            allocator.free(sessions);
+        }
+
+        for (rows) |row| {
+            if (row.len < 4) continue;
+            sessions[filled] = .{
+                .session_id = try allocator.dupe(u8, row[0]),
+                .message_count = std.fmt.parseInt(u64, row[1], 10) catch 0,
+                .first_message_at = try allocator.dupe(u8, row[2]),
+                .last_message_at = try allocator.dupe(u8, row[3]),
+            };
+            filled += 1;
+        }
+
+        if (filled < sessions.len) {
+            return allocator.realloc(sessions, filled);
+        }
+        return sessions;
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const query = try std.fmt.allocPrint(self_.allocator,
+            \\SELECT toString(count()) FROM {s}.{s}
+            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}}
+        , .{ self_.db_q, self_.messages_table_q });
+        defer self_.allocator.free(query);
+
+        const body = try self_.executeQuery(self_.allocator, query, &.{
+            .{ "sid", session_id },
+            .{ "iid", self_.instance_id },
+        });
+        defer self_.allocator.free(body);
+
+        const trimmed = std.mem.trim(u8, body, " \t\n\r");
+        if (trimmed.len == 0) return 0;
+        return std.fmt.parseInt(u64, trimmed, 10) catch 0;
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        var limit_buf: [20]u8 = undefined;
+        const limit_str = try std.fmt.bufPrint(&limit_buf, "{d}", .{limit});
+        var offset_buf: [20]u8 = undefined;
+        const offset_str = try std.fmt.bufPrint(&offset_buf, "{d}", .{offset});
+
+        const query = try std.fmt.allocPrint(allocator,
+            \\SELECT role, content, toString(created_at) FROM {s}.{s}
+            \\WHERE session_id = {{sid:String}} AND instance_id = {{iid:String}}
+            \\ORDER BY message_order ASC, message_id ASC
+            \\LIMIT {{limit:UInt64}} OFFSET {{offset:UInt64}}
+        , .{ self_.db_q, self_.messages_table_q });
+        defer allocator.free(query);
+
+        const body = try self_.executeQuery(allocator, query, &.{
+            .{ "sid", session_id },
+            .{ "iid", self_.instance_id },
+            .{ "limit", limit_str },
+            .{ "offset", offset_str },
+        });
+        defer allocator.free(body);
+
+        const rows = try parseTsvRows(allocator, body);
+        defer freeTsvRows(allocator, rows);
+
+        var messages = try allocator.alloc(root.DetailedMessageEntry, rows.len);
+        var filled: usize = 0;
+        errdefer {
+            for (messages[0..filled]) |entry| {
+                allocator.free(entry.role);
+                allocator.free(entry.content);
+                allocator.free(entry.created_at);
+            }
+            allocator.free(messages);
+        }
+
+        for (rows) |row| {
+            if (row.len < 3) continue;
+            messages[filled] = .{
+                .role = try allocator.dupe(u8, row[0]),
+                .content = try allocator.dupe(u8, row[1]),
+                .created_at = try allocator.dupe(u8, row[2]),
+            };
+            filled += 1;
+        }
+
+        if (filled < messages.len) {
+            return allocator.realloc(messages, filled);
+        }
+        return messages;
+    }
+
     const session_vtable = SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -1128,6 +1277,10 @@ const ClickHouseMemoryImpl = struct {
         .clearAutoSaved = &implSessionClearAutoSaved,
         .saveUsage = &implSessionSaveUsage,
         .loadUsage = &implSessionLoadUsage,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) SessionStore {

@@ -699,6 +699,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
                 const out = &bw.interface;
                 out.writeAll("null\n") catch return;
                 out.flush() catch return;
+                return;
             } else {
                 std.debug.print("Skill '{s}' not found or invalid.\n", .{sub_args[1]});
             }
@@ -1087,6 +1088,18 @@ fn printRetrievalScoreLine(c: yc.memory.RetrievalCandidate) void {
     }
 }
 
+fn buildHistoryMemoryConfig(base: yc.config.config_types.MemoryConfig) yc.config.config_types.MemoryConfig {
+    var cfg = base;
+    // History is read-only; avoid bootstrapping retrieval/vector paths or maintenance hooks.
+    cfg.search.enabled = false;
+    cfg.qmd.enabled = false;
+    cfg.lifecycle.hygiene_enabled = false;
+    cfg.lifecycle.snapshot_on_hygiene = false;
+    cfg.lifecycle.auto_hydrate = false;
+    cfg.response_cache.enabled = false;
+    return cfg;
+}
+
 fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
     if (sub_args.len < 1) {
         printMemoryUsage();
@@ -1451,13 +1464,14 @@ fn runHistory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     };
     defer cfg.deinit();
 
-    var mem_rt = yc.memory.initRuntime(allocator, &cfg.memory, cfg.workspace_dir) orelse {
+    var history_memory_cfg = buildHistoryMemoryConfig(cfg.memory);
+    var mem_rt = yc.memory.initRuntime(allocator, &history_memory_cfg, cfg.workspace_dir) orelse {
         if (wants_json) {
             var msg_buf: [256]u8 = undefined;
-            const msg = std.fmt.bufPrint(&msg_buf, "Failed to initialize memory runtime (backend: {s})", .{cfg.memory.backend}) catch "Failed to initialize memory runtime";
+            const msg = std.fmt.bufPrint(&msg_buf, "Failed to initialize history runtime (backend: {s})", .{cfg.memory.backend}) catch "Failed to initialize history runtime";
             writeJsonError("memory_runtime_init_failed", msg, cfg.memory.backend);
         }
-        std.debug.print("Failed to initialize memory runtime (backend: {s})\n", .{cfg.memory.backend});
+        std.debug.print("Failed to initialize history runtime (backend: {s})\n", .{cfg.memory.backend});
         std.process.exit(1);
     };
     defer mem_rt.deinit();
@@ -3391,6 +3405,24 @@ test "parseNonNegativeUsize accepts zero and positive integers" {
     try std.testing.expectEqual(@as(?usize, 42), parseNonNegativeUsize("42"));
     try std.testing.expect(parseNonNegativeUsize("-1") == null);
     try std.testing.expect(parseNonNegativeUsize("bad") == null);
+}
+
+test "buildHistoryMemoryConfig disables side-effectful runtime features" {
+    var cfg = yc.config.config_types.MemoryConfig{};
+    cfg.search.enabled = true;
+    cfg.qmd.enabled = true;
+    cfg.lifecycle.hygiene_enabled = true;
+    cfg.lifecycle.snapshot_on_hygiene = true;
+    cfg.lifecycle.auto_hydrate = true;
+    cfg.response_cache.enabled = true;
+
+    const history_cfg = buildHistoryMemoryConfig(cfg);
+    try std.testing.expect(!history_cfg.search.enabled);
+    try std.testing.expect(!history_cfg.qmd.enabled);
+    try std.testing.expect(!history_cfg.lifecycle.hygiene_enabled);
+    try std.testing.expect(!history_cfg.lifecycle.snapshot_on_hygiene);
+    try std.testing.expect(!history_cfg.lifecycle.auto_hydrate);
+    try std.testing.expect(!history_cfg.response_cache.enabled);
 }
 
 test "hasJsonFlag detects --json" {

@@ -105,6 +105,10 @@ const PostgresMemoryImpl = struct {
     q_save_usage: []const u8,
     q_load_usage: []const u8,
     q_clear_usage: []const u8,
+    q_count_sessions: []const u8,
+    q_list_sessions: []const u8,
+    q_count_detailed_msgs: []const u8,
+    q_load_msgs_detailed: []const u8,
     q_clear_auto: []const u8,
     q_clear_auto_sid: []const u8,
     q_recall_sid: []const u8,
@@ -148,6 +152,10 @@ const PostgresMemoryImpl = struct {
             .q_save_usage = undefined,
             .q_load_usage = undefined,
             .q_clear_usage = undefined,
+            .q_count_sessions = undefined,
+            .q_list_sessions = undefined,
+            .q_count_detailed_msgs = undefined,
+            .q_load_msgs_detailed = undefined,
             .q_clear_auto = undefined,
             .q_clear_auto_sid = undefined,
             .q_recall_sid = undefined,
@@ -204,6 +212,18 @@ const PostgresMemoryImpl = struct {
         self_.q_clear_usage = try buildQuery(allocator, "DELETE FROM {schema}.session_usage WHERE session_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_usage);
 
+        self_.q_count_sessions = try buildQuery(allocator, "SELECT COUNT(*) FROM (SELECT 1 FROM {schema}.messages GROUP BY session_id) AS sessions", schema_q, table_q);
+        errdefer allocator.free(self_.q_count_sessions);
+
+        self_.q_list_sessions = try buildQuery(allocator, "SELECT session_id, COUNT(*), MIN(created_at)::text, MAX(created_at)::text FROM {schema}.messages GROUP BY session_id ORDER BY MAX(created_at) DESC LIMIT $1 OFFSET $2", schema_q, table_q);
+        errdefer allocator.free(self_.q_list_sessions);
+
+        self_.q_count_detailed_msgs = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.messages WHERE session_id = $1", schema_q, table_q);
+        errdefer allocator.free(self_.q_count_detailed_msgs);
+
+        self_.q_load_msgs_detailed = try buildQuery(allocator, "SELECT role, content, created_at::text FROM {schema}.messages WHERE session_id = $1 ORDER BY id ASC LIMIT $2 OFFSET $3", schema_q, table_q);
+        errdefer allocator.free(self_.q_load_msgs_detailed);
+
         self_.q_clear_auto = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND instance_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_auto);
 
@@ -244,6 +264,10 @@ const PostgresMemoryImpl = struct {
         self.allocator.free(self.q_save_usage);
         self.allocator.free(self.q_load_usage);
         self.allocator.free(self.q_clear_usage);
+        self.allocator.free(self.q_count_sessions);
+        self.allocator.free(self.q_list_sessions);
+        self.allocator.free(self.q_count_detailed_msgs);
+        self.allocator.free(self.q_load_msgs_detailed);
         self.allocator.free(self.q_clear_auto);
         self.allocator.free(self.q_clear_auto_sid);
         self.allocator.free(self.q_recall_sid);
@@ -760,6 +784,128 @@ const PostgresMemoryImpl = struct {
         return try std.fmt.parseInt(u64, raw[0..len], 10);
     }
 
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const result = try self_.execParams(self_.q_count_sessions, &.{}, &.{});
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return 0;
+        const raw = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return std.fmt.parseInt(u64, raw[0..len], 10) catch 0;
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        var limit_buf: [20]u8 = undefined;
+        const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+        var offset_buf: [20]u8 = undefined;
+        const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
+
+        const params = [_]?[*:0]const u8{ limit_str.ptr, offset_str.ptr };
+        const lengths = [_]c_int{ @intCast(std.mem.len(limit_str)), @intCast(std.mem.len(offset_str)) };
+
+        const result = try self_.execParams(self_.q_list_sessions, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows = c.PQntuples(result);
+        var sessions = try allocator.alloc(root.SessionInfo, @intCast(nrows));
+        var filled: usize = 0;
+        errdefer {
+            for (sessions[0..filled]) |info| info.deinit(allocator);
+            allocator.free(sessions);
+        }
+
+        var row: c_int = 0;
+        while (row < nrows) : (row += 1) {
+            if (c.PQgetisnull(result, row, 0) != 0) continue;
+
+            const raw_count = c.PQgetvalue(result, row, 1);
+            const raw_count_len: usize = @intCast(c.PQgetlength(result, row, 1));
+
+            sessions[filled] = .{
+                .session_id = try dupeResultValue(allocator, result, row, 0),
+                .message_count = std.fmt.parseInt(u64, raw_count[0..raw_count_len], 10) catch 0,
+                .first_message_at = try dupeResultValue(allocator, result, row, 2),
+                .last_message_at = try dupeResultValue(allocator, result, row, 3),
+            };
+            filled += 1;
+        }
+
+        if (filled < sessions.len) {
+            return allocator.realloc(sessions, filled);
+        }
+        return sessions;
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sid_z = try self_.allocator.dupeZ(u8, session_id);
+        defer self_.allocator.free(sid_z);
+
+        const params = [_]?[*:0]const u8{sid_z};
+        const lengths = [_]c_int{@intCast(session_id.len)};
+
+        const result = try self_.execParams(self_.q_count_detailed_msgs, &params, &lengths);
+        defer c.PQclear(result);
+
+        if (c.PQntuples(result) == 0) return 0;
+        const raw = c.PQgetvalue(result, 0, 0);
+        const len: usize = @intCast(c.PQgetlength(result, 0, 0));
+        return std.fmt.parseInt(u64, raw[0..len], 10) catch 0;
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self_: *Self = @ptrCast(@alignCast(ptr));
+
+        const sid_z = try allocator.dupeZ(u8, session_id);
+        defer allocator.free(sid_z);
+        var limit_buf: [20]u8 = undefined;
+        const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
+        var offset_buf: [20]u8 = undefined;
+        const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
+
+        const params = [_]?[*:0]const u8{ sid_z, limit_str.ptr, offset_str.ptr };
+        const lengths = [_]c_int{
+            @intCast(session_id.len),
+            @intCast(std.mem.len(limit_str)),
+            @intCast(std.mem.len(offset_str)),
+        };
+
+        const result = try self_.execParams(self_.q_load_msgs_detailed, &params, &lengths);
+        defer c.PQclear(result);
+
+        const nrows = c.PQntuples(result);
+        var messages = try allocator.alloc(root.DetailedMessageEntry, @intCast(nrows));
+        var filled: usize = 0;
+        errdefer {
+            for (messages[0..filled]) |entry| {
+                allocator.free(entry.role);
+                allocator.free(entry.content);
+                allocator.free(entry.created_at);
+            }
+            allocator.free(messages);
+        }
+
+        var row: c_int = 0;
+        while (row < nrows) : (row += 1) {
+            messages[filled] = .{
+                .role = try dupeResultValue(allocator, result, row, 0),
+                .content = try dupeResultValue(allocator, result, row, 1),
+                .created_at = try dupeResultValue(allocator, result, row, 2),
+            };
+            filled += 1;
+        }
+
+        if (filled < messages.len) {
+            return allocator.realloc(messages, filled);
+        }
+        return messages;
+    }
+
     const session_vtable = SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -767,6 +913,10 @@ const PostgresMemoryImpl = struct {
         .clearAutoSaved = &implSessionClearAutoSaved,
         .saveUsage = &implSessionSaveUsage,
         .loadUsage = &implSessionLoadUsage,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) SessionStore {
