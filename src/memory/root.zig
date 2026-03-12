@@ -154,6 +154,41 @@ pub fn freeMessages(allocator: std.mem.Allocator, messages: []MessageEntry) void
     allocator.free(messages);
 }
 
+/// Session summary for listing sessions.
+pub const SessionInfo = struct {
+    session_id: []const u8,
+    message_count: u64,
+    first_message_at: []const u8,
+    last_message_at: []const u8,
+
+    pub fn deinit(self: SessionInfo, allocator: std.mem.Allocator) void {
+        allocator.free(self.session_id);
+        allocator.free(self.first_message_at);
+        allocator.free(self.last_message_at);
+    }
+};
+
+pub fn freeSessionInfos(allocator: std.mem.Allocator, infos: []SessionInfo) void {
+    for (infos) |info| info.deinit(allocator);
+    allocator.free(infos);
+}
+
+/// Message with timestamp for detailed history.
+pub const DetailedMessageEntry = struct {
+    role: []const u8,
+    content: []const u8,
+    created_at: []const u8,
+};
+
+pub fn freeDetailedMessages(allocator: std.mem.Allocator, entries: []DetailedMessageEntry) void {
+    for (entries) |entry| {
+        allocator.free(entry.role);
+        allocator.free(entry.content);
+        allocator.free(entry.created_at);
+    }
+    allocator.free(entries);
+}
+
 // ── SessionStore vtable interface ─────────────────────────────────
 
 pub const SessionStore = struct {
@@ -167,6 +202,10 @@ pub const SessionStore = struct {
         clearAutoSaved: *const fn (ptr: *anyopaque, session_id: ?[]const u8) anyerror!void,
         saveUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8, total_tokens: u64) anyerror!void = null,
         loadUsage: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!?u64 = null,
+        countSessions: ?*const fn (ptr: *anyopaque) anyerror!u64 = null,
+        listSessions: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]SessionInfo = null,
+        countDetailedMessages: ?*const fn (ptr: *anyopaque, session_id: []const u8) anyerror!u64 = null,
+        loadMessagesDetailed: ?*const fn (ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]DetailedMessageEntry = null,
     };
 
     pub fn saveMessage(self: SessionStore, session_id: []const u8, role: []const u8, content: []const u8) !void {
@@ -193,6 +232,26 @@ pub const SessionStore = struct {
     pub fn loadUsage(self: SessionStore, session_id: []const u8) !?u64 {
         const func = self.vtable.loadUsage orelse return null;
         return func(self.ptr, session_id);
+    }
+
+    pub fn countSessions(self: SessionStore) !u64 {
+        const func = self.vtable.countSessions orelse return error.NotSupported;
+        return func(self.ptr);
+    }
+
+    pub fn listSessions(self: SessionStore, allocator: std.mem.Allocator, limit: usize, offset: usize) ![]SessionInfo {
+        const func = self.vtable.listSessions orelse return error.NotSupported;
+        return func(self.ptr, allocator, limit, offset);
+    }
+
+    pub fn countDetailedMessages(self: SessionStore, session_id: []const u8) !u64 {
+        const func = self.vtable.countDetailedMessages orelse return error.NotSupported;
+        return func(self.ptr, session_id);
+    }
+
+    pub fn loadMessagesDetailed(self: SessionStore, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) ![]DetailedMessageEntry {
+        const func = self.vtable.loadMessagesDetailed orelse return error.NotSupported;
+        return func(self.ptr, allocator, session_id, limit, offset);
     }
 };
 

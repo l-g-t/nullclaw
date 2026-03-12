@@ -532,11 +532,11 @@ fn appendSkillsSection(
     w: anytype,
     workspace_dir: []const u8,
 ) !void {
-    // Two-source loading: workspace skills + ~/.nullclaw/skills/community/
+    // Two-source loading: workspace skills + ~/.nullclaw/skills/
     const home_dir = platform.getHomeDir(allocator) catch null;
     defer if (home_dir) |h| allocator.free(h);
     const community_base = if (home_dir) |h|
-        std.fs.path.join(allocator, &.{ h, ".nullclaw", "skills" }) catch null
+        std.fs.path.join(allocator, &.{ h, ".nullclaw" }) catch null
     else
         null;
     defer if (community_base) |cb| allocator.free(cb);
