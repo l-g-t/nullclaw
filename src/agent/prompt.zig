@@ -114,6 +114,7 @@ pub const ConversationContext = struct {
     // Signal
     sender_number: ?[]const u8 = null,
     sender_uuid: ?[]const u8 = null,
+    sender_name: ?[]const u8 = null,
     // Discord
     sender_id: ?[]const u8 = null,
     sender_username: ?[]const u8 = null,
@@ -128,7 +129,7 @@ pub const ConversationContext = struct {
     pub fn senderFingerprint(self: ConversationContext) u64 {
         var h = std.hash.Wyhash.init(0x1234_5678);
         // Hash each sender-identifying field (or a sentinel null byte).
-        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_username, self.sender_display_name }) |field| {
+        inline for (.{ self.sender_id, self.sender_uuid, self.sender_number, self.sender_name, self.sender_username, self.sender_display_name }) |field| {
             if (field) |v| {
                 h.update(v);
             } else {
@@ -246,8 +247,15 @@ pub fn buildSystemPrompt(
         if (cc.sender_number) |num| {
             try std.fmt.format(w, "- Sender phone: {s}\n", .{num});
         }
-        if (cc.sender_uuid) |uuid| {
-            try std.fmt.format(w, "- Sender UUID: {s}\n", .{uuid});
+        // Show sender identity: "Sender: Name (UUID)" or just "Sender: (UUID)"
+        if (cc.sender_name) |name| {
+            if (cc.sender_uuid) |uuid| {
+                try std.fmt.format(w, "- Sender: {s} ({s})\n", .{ name, uuid });
+            } else {
+                try std.fmt.format(w, "- Sender: {s}\n", .{name});
+            }
+        } else if (cc.sender_uuid) |uuid| {
+            try std.fmt.format(w, "- Sender: ({s})\n", .{uuid});
         }
         // Discord sender fields
         if (cc.sender_id) |sid| {
