@@ -3957,7 +3957,8 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
     }
     if (state.pairing_guard) |*guard| {
         if (guard.pairingCode()) |code| {
-            try stdout.print("Gateway pairing code: {s}\n", .{code});
+            _ = code;
+            try stdout.print("Gateway pairing code generated (hidden for security). Use the /pair flow to complete pairing.\n", .{});
             try stdout.flush();
         }
     }

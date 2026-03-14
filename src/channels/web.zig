@@ -447,9 +447,9 @@ pub const WebChannel = struct {
             }
         } else if (self.relay_pairing_guard) |*guard| {
             if (guard.pairingCode()) |code| {
-                log.info("Web relay pairing code (one-time, {d}s TTL): {s}", .{
+                _ = code;
+                log.info("Web relay pairing code generated (one-time, {d}s TTL, value hidden)", .{
                     self.relay_pairing_code_ttl_secs,
-                    code,
                 });
             }
         }
