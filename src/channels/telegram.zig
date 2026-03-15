@@ -18,7 +18,7 @@ const log = std.log.scoped(.telegram);
 const MEDIA_GROUP_FLUSH_SECS: u64 = 3;
 const TEMP_MEDIA_SWEEP_INTERVAL_POLLS: u32 = 20;
 const TEMP_MEDIA_TTL_SECS: i64 = 24 * 60 * 60;
-const TELEGRAM_BOT_COMMANDS_JSON = control_plane.TELEGRAM_BOT_COMMANDS_JSON;
+const TOPIC_TARGET_SEPARATOR = "#topic:";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Attachment Types
@@ -70,6 +70,35 @@ pub const ParsedMessage = struct {
     }
 };
 
+const OwnedOutboundPayload = struct {
+    text: []u8,
+    attachments: []root.Channel.OutboundAttachment,
+    choices: []root.Channel.OutboundChoice,
+
+    fn deinit(self: *OwnedOutboundPayload, allocator: std.mem.Allocator) void {
+        allocator.free(self.text);
+        for (self.attachments) |attachment| {
+            allocator.free(attachment.target);
+            if (attachment.caption) |caption| allocator.free(caption);
+        }
+        allocator.free(self.attachments);
+        for (self.choices) |choice| {
+            allocator.free(choice.id);
+            allocator.free(choice.label);
+            allocator.free(choice.submit_text);
+        }
+        allocator.free(self.choices);
+    }
+
+    fn payload(self: *const OwnedOutboundPayload) root.Channel.OutboundPayload {
+        return .{
+            .text = self.text,
+            .attachments = self.attachments,
+            .choices = self.choices,
+        };
+    }
+};
+
 const PendingInteractionOption = struct {
     id: []const u8,
     label: []const u8,
@@ -101,6 +130,58 @@ const PendingInteraction = struct {
 };
 
 const DraftState = telegram_draft_presenter.DraftState;
+
+const ParsedTelegramTarget = struct {
+    chat_id: []const u8,
+    message_thread_id: ?i64 = null,
+};
+
+pub const TaskReaction = enum {
+    accepted,
+    running,
+    done,
+    failed,
+};
+
+fn parseTelegramTarget(target: []const u8) ParsedTelegramTarget {
+    const sep = std.mem.lastIndexOf(u8, target, TOPIC_TARGET_SEPARATOR) orelse return .{ .chat_id = target };
+    const chat_id = target[0..sep];
+    const thread_raw = target[sep + TOPIC_TARGET_SEPARATOR.len ..];
+    if (chat_id.len == 0 or thread_raw.len == 0) return .{ .chat_id = target };
+    const thread_id = std.fmt.parseInt(i64, thread_raw, 10) catch return .{ .chat_id = target };
+    return .{
+        .chat_id = chat_id,
+        .message_thread_id = if (thread_id > 0) thread_id else null,
+    };
+}
+
+pub fn targetChatId(target: []const u8) []const u8 {
+    return parseTelegramTarget(target).chat_id;
+}
+
+pub fn targetThreadId(target: []const u8) ?i64 {
+    return parseTelegramTarget(target).message_thread_id;
+}
+
+fn dupTelegramTarget(allocator: std.mem.Allocator, chat_id: []const u8, message_thread_id: ?i64) ![]u8 {
+    if (message_thread_id) |thread_id| {
+        return std.fmt.allocPrint(allocator, "{s}{s}{d}", .{ chat_id, TOPIC_TARGET_SEPARATOR, thread_id });
+    }
+    return allocator.dupe(u8, chat_id);
+}
+
+fn countUtf8Codepoints(text: []const u8) !usize {
+    var i: usize = 0;
+    var count: usize = 0;
+    while (i < text.len) {
+        const seq_len = try std.unicode.utf8ByteSequenceLength(text[i]);
+        if (i + seq_len > text.len) return error.InvalidUtf8;
+        _ = try std.unicode.utf8Decode(text[i .. i + seq_len]);
+        i += seq_len;
+        count += 1;
+    }
+    return count;
+}
 
 /// Infer attachment kind from file extension.
 pub fn inferAttachmentKindFromExtension(path: []const u8) AttachmentKind {
@@ -369,6 +450,133 @@ fn parseMarkerKind(kind_str: []const u8) ?AttachmentKind {
     return null;
 }
 
+fn to_root_attachment_kind(kind: AttachmentKind) root.Channel.OutboundAttachmentKind {
+    return switch (kind) {
+        .image => .image,
+        .document => .document,
+        .video => .video,
+        .audio => .audio,
+        .voice => .voice,
+    };
+}
+
+fn from_root_attachment_kind(kind: root.Channel.OutboundAttachmentKind) AttachmentKind {
+    return switch (kind) {
+        .image => .image,
+        .document => .document,
+        .video => .video,
+        .audio => .audio,
+        .voice => .voice,
+    };
+}
+
+fn buildChoicesDirectiveFromPayload(
+    allocator: std.mem.Allocator,
+    choices: []const root.Channel.OutboundChoice,
+) !interaction_choices.ChoicesDirective {
+    if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) {
+        return error.InvalidChoices;
+    }
+
+    var options = try allocator.alloc(interaction_choices.ChoiceOption, choices.len);
+    var built: usize = 0;
+    errdefer {
+        for (options[0..built]) |opt| opt.deinit(allocator);
+        allocator.free(options);
+    }
+
+    for (choices, 0..) |choice, i| {
+        if (choice.id.len == 0 or choice.id.len > interaction_choices.MAX_ID_LEN) return error.InvalidChoices;
+        if (choice.label.len == 0 or choice.label.len > interaction_choices.MAX_LABEL_LEN) return error.InvalidChoices;
+        if (choice.submit_text.len == 0 or choice.submit_text.len > interaction_choices.MAX_SUBMIT_TEXT_LEN) return error.InvalidChoices;
+
+        options[i] = .{
+            .id = try allocator.dupe(u8, choice.id),
+            .label = try allocator.dupe(u8, choice.label),
+            .submit_text = try allocator.dupe(u8, choice.submit_text),
+        };
+        built += 1;
+    }
+
+    return .{
+        .version = 1,
+        .options = options,
+    };
+}
+
+fn buildOwnedOutboundPayloadFromLegacy(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    media: []const []const u8,
+    allow_choices: bool,
+) !OwnedOutboundPayload {
+    var parsed_choices = try interaction_choices.parseAssistantChoices(allocator, text);
+    defer parsed_choices.deinit(allocator);
+
+    const parsed = try parseAttachmentMarkers(allocator, parsed_choices.visible_text);
+    defer parsed.deinit(allocator);
+
+    const choices_enabled = allow_choices and parsed_choices.choices != null and parsed.attachments.len == 0 and media.len == 0;
+    const attachments_len = parsed.attachments.len + media.len;
+    var attachments = try allocator.alloc(root.Channel.OutboundAttachment, attachments_len);
+    var built_attachments: usize = 0;
+    errdefer {
+        for (attachments[0..built_attachments]) |attachment| {
+            allocator.free(attachment.target);
+            if (attachment.caption) |caption| allocator.free(caption);
+        }
+        allocator.free(attachments);
+    }
+
+    for (parsed.attachments, 0..) |attachment, i| {
+        attachments[i] = .{
+            .kind = to_root_attachment_kind(attachment.kind),
+            .target = try allocator.dupe(u8, attachment.target),
+            .caption = if (attachment.caption) |caption| try allocator.dupe(u8, caption) else null,
+        };
+        built_attachments += 1;
+    }
+    for (media, 0..) |item, i| {
+        attachments[parsed.attachments.len + i] = .{
+            .kind = to_root_attachment_kind(inferAttachmentKindFromExtension(item)),
+            .target = try allocator.dupe(u8, item),
+            .caption = null,
+        };
+        built_attachments += 1;
+    }
+
+    const choices = if (choices_enabled)
+        try allocator.alloc(root.Channel.OutboundChoice, parsed_choices.choices.?.options.len)
+    else
+        try allocator.alloc(root.Channel.OutboundChoice, 0);
+    var built_choices: usize = 0;
+    errdefer {
+        for (choices[0..built_choices]) |choice| {
+            allocator.free(choice.id);
+            allocator.free(choice.label);
+            allocator.free(choice.submit_text);
+        }
+        allocator.free(choices);
+    }
+
+    if (choices_enabled) {
+        for (parsed_choices.choices.?.options, 0..) |choice, i| {
+            choices[i] = .{
+                .id = try allocator.dupe(u8, choice.id),
+                .label = try allocator.dupe(u8, choice.label),
+                .submit_text = try allocator.dupe(u8, choice.submit_text),
+            };
+            built_choices += 1;
+        }
+    }
+
+    return .{
+        .text = try allocator.dupe(u8, parsed.remaining_text),
+        .attachments = attachments,
+        .choices = choices,
+    };
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Smart Message Splitting
 // ════════════════════════════════════════════════════════════════════════════
@@ -456,6 +664,12 @@ pub const TelegramChannel = struct {
     draft_id_counter: Atomic(u64) = Atomic(u64).init(1),
     draft_global_suppress_until_ms: i64 = 0,
     streaming_enabled: bool = true,
+    status_reactions_enabled: bool = false,
+    reaction_emojis: config_types.TelegramReactionEmojisConfig = .{},
+    binding_commands_enabled: bool = true,
+    topic_commands_enabled: bool = true,
+    topic_map_command_enabled: bool = true,
+    commands_menu_mode: config_types.TelegramCommandsMenuMode = .flat,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
     const CONTINUATION_MARKER = "\n\n\u{23EC}";
@@ -511,6 +725,12 @@ pub const TelegramChannel = struct {
         ch.interactive = cfg.interactive;
         ch.require_mention = cfg.require_mention;
         ch.streaming_enabled = cfg.streaming;
+        ch.status_reactions_enabled = cfg.status_reactions;
+        ch.reaction_emojis = cfg.reaction_emojis;
+        ch.binding_commands_enabled = cfg.binding_commands_enabled;
+        ch.topic_commands_enabled = cfg.topic_commands_enabled;
+        ch.topic_map_command_enabled = cfg.topic_map_command_enabled;
+        ch.commands_menu_mode = cfg.commands_menu_mode;
         return ch;
     }
 
@@ -747,12 +967,66 @@ pub const TelegramChannel = struct {
             containsMentionInEntitySet(message, "caption_entities", "caption", bot_name, self.bot_user_id);
     }
 
-    /// Register bot commands with Telegram so they appear in the "/" menu.
-    pub fn setMyCommands(self: *TelegramChannel) void {
-        self.api().setMyCommands(TELEGRAM_BOT_COMMANDS_JSON) catch |err| {
-            log.warn("setMyCommands failed: {}", .{err});
-            return;
-        };
+    fn setMyCommandsForScope(
+        self: *TelegramChannel,
+        scope: control_plane.TelegramBotCommandScope,
+        include_bind_command: bool,
+        include_topic_command: bool,
+        include_topics_command: bool,
+    ) !void {
+        const commands_json = try control_plane.buildTelegramBotCommandsJson(self.allocator, .{
+            .scope = scope,
+            .include_bind_command = include_bind_command,
+            .include_topic_command = include_topic_command,
+            .include_topics_command = include_topics_command,
+        });
+        defer self.allocator.free(commands_json);
+        try self.api().setMyCommands(commands_json);
+    }
+
+    fn deleteMyCommandsForScope(self: *TelegramChannel, scope: control_plane.TelegramBotCommandScope) !void {
+        const body_json = try control_plane.buildTelegramDeleteBotCommandsJson(self.allocator, scope);
+        defer self.allocator.free(body_json);
+        try self.api().deleteMyCommands(body_json);
+    }
+
+    /// Keep Telegram slash-command menus in sync with config.
+    pub fn syncCommandsMenu(self: *TelegramChannel) void {
+        switch (self.commands_menu_mode) {
+            .off => {
+                self.deleteMyCommandsForScope(.default) catch |err| {
+                    log.warn("deleteMyCommands(default) failed: {}", .{err});
+                };
+                self.deleteMyCommandsForScope(.all_private_chats) catch |err| {
+                    log.warn("deleteMyCommands(all_private_chats) failed: {}", .{err});
+                };
+                self.deleteMyCommandsForScope(.all_group_chats) catch |err| {
+                    log.warn("deleteMyCommands(all_group_chats) failed: {}", .{err});
+                };
+            },
+            .flat => {
+                self.setMyCommandsForScope(.default, self.binding_commands_enabled, self.topic_commands_enabled, self.topic_map_command_enabled) catch |err| {
+                    log.warn("setMyCommands(default) failed: {}", .{err});
+                };
+                self.deleteMyCommandsForScope(.all_private_chats) catch |err| {
+                    log.warn("deleteMyCommands(all_private_chats) failed: {}", .{err});
+                };
+                self.deleteMyCommandsForScope(.all_group_chats) catch |err| {
+                    log.warn("deleteMyCommands(all_group_chats) failed: {}", .{err});
+                };
+            },
+            .scoped => {
+                self.setMyCommandsForScope(.all_private_chats, self.binding_commands_enabled, false, false) catch |err| {
+                    log.warn("setMyCommands(all_private_chats) failed: {}", .{err});
+                };
+                self.setMyCommandsForScope(.all_group_chats, self.binding_commands_enabled, self.topic_commands_enabled, self.topic_map_command_enabled) catch |err| {
+                    log.warn("setMyCommands(all_group_chats) failed: {}", .{err});
+                };
+                self.deleteMyCommandsForScope(.default) catch |err| {
+                    log.warn("deleteMyCommands(default) failed: {}", .{err});
+                };
+            },
+        }
     }
 
     /// Disable webhook mode before polling, preserving queued updates.
@@ -782,10 +1056,41 @@ pub const TelegramChannel = struct {
     // ── Typing indicator ────────────────────────────────────────────
 
     /// Send a "typing" chat action. Best-effort: errors are ignored.
-    pub fn sendTypingIndicator(self: *TelegramChannel, chat_id: []const u8) void {
+    pub fn sendTypingIndicator(self: *TelegramChannel, target: []const u8) void {
         if (builtin.is_test) return;
-        if (chat_id.len == 0) return;
-        self.api().sendTypingIndicator(chat_id) catch return;
+        if (target.len == 0) return;
+        const parsed_target = parseTelegramTarget(target);
+        self.api().sendTypingIndicator(parsed_target.chat_id, parsed_target.message_thread_id) catch return;
+    }
+
+    pub fn setTaskReaction(self: *TelegramChannel, target: []const u8, message_id: ?i64, reaction: TaskReaction) void {
+        if (builtin.is_test or !self.status_reactions_enabled) return;
+        const msg_id = message_id orelse return;
+        if (target.len == 0) return;
+        const parsed_target = parseTelegramTarget(target);
+        self.api().setMessageReaction(parsed_target.chat_id, msg_id, self.taskReactionEmoji(reaction)) catch |err| {
+            log.debug("telegram setMessageReaction failed: {}", .{err});
+        };
+    }
+
+    fn taskReactionEmoji(self: *const TelegramChannel, reaction: TaskReaction) ?[]const u8 {
+        const emoji = switch (reaction) {
+            .accepted => self.reaction_emojis.accepted,
+            .running => self.reaction_emojis.running,
+            .done => self.reaction_emojis.done,
+            .failed => self.reaction_emojis.failed,
+        };
+        return if (emoji.len == 0) null else emoji;
+    }
+
+    pub fn createForumTopicFromTarget(self: *TelegramChannel, target: []const u8, name: []const u8) !i64 {
+        const trimmed = std.mem.trim(u8, name, " \t\r\n");
+        const name_len = try countUtf8Codepoints(trimmed);
+        if (name_len == 0 or name_len > 128) return error.InvalidTopicName;
+
+        const parsed_target = parseTelegramTarget(target);
+        const topic = try self.api().createForumTopic(self.allocator, parsed_target.chat_id, trimmed);
+        return topic.message_thread_id;
     }
 
     pub fn startTyping(self: *TelegramChannel, chat_id: []const u8) !void {
@@ -910,23 +1215,6 @@ pub const TelegramChannel = struct {
         var buf: [32]u8 = undefined;
         const token = try std.fmt.bufPrint(&buf, "{x}", .{seq});
         return self.allocator.dupe(u8, token);
-    }
-
-    fn isAttachmentMarkerCandidate(text: []const u8) bool {
-        return std.mem.indexOf(u8, text, "[IMAGE:") != null or
-            std.mem.indexOf(u8, text, "[image:") != null or
-            std.mem.indexOf(u8, text, "[FILE:") != null or
-            std.mem.indexOf(u8, text, "[file:") != null or
-            std.mem.indexOf(u8, text, "[DOCUMENT:") != null or
-            std.mem.indexOf(u8, text, "[document:") != null or
-            std.mem.indexOf(u8, text, "[PHOTO:") != null or
-            std.mem.indexOf(u8, text, "[photo:") != null or
-            std.mem.indexOf(u8, text, "[VIDEO:") != null or
-            std.mem.indexOf(u8, text, "[video:") != null or
-            std.mem.indexOf(u8, text, "[AUDIO:") != null or
-            std.mem.indexOf(u8, text, "[audio:") != null or
-            std.mem.indexOf(u8, text, "[VOICE:") != null or
-            std.mem.indexOf(u8, text, "[voice:") != null;
     }
 
     fn buildInlineKeyboardJson(
@@ -1130,15 +1418,17 @@ pub const TelegramChannel = struct {
     /// Send text with HTML parse_mode (converted from Markdown); on failure, retry as plain text.
     fn sendWithMarkdownFallbackWithMarkup(
         self: *TelegramChannel,
-        chat_id: []const u8,
+        target: []const u8,
         text: []const u8,
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
+        const parsed_target = parseTelegramTarget(target);
+
         // Convert Markdown → Telegram HTML
         const html_text = markdownToTelegramHtml(self.allocator, text) catch {
             // Conversion failed — send as plain text
-            return try self.sendChunkPlainWithMarkup(chat_id, text, reply_to, reply_markup_json);
+            return try self.sendChunkPlainWithMarkup(target, text, reply_to, reply_markup_json);
         };
         defer self.allocator.free(html_text);
 
@@ -1147,31 +1437,32 @@ pub const TelegramChannel = struct {
         defer html_body.deinit(self.allocator);
 
         try html_body.appendSlice(self.allocator, "{\"chat_id\":");
-        try html_body.appendSlice(self.allocator, chat_id);
+        try html_body.appendSlice(self.allocator, parsed_target.chat_id);
         try html_body.appendSlice(self.allocator, ",\"text\":");
         try root.json_util.appendJsonString(&html_body, self.allocator, html_text);
         try html_body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"");
+        try telegram_api.appendMessageThreadId(&html_body, self.allocator, parsed_target.message_thread_id);
         try telegram_api.appendReplyTo(&html_body, self.allocator, reply_to);
         try telegram_api.appendRawReplyMarkup(&html_body, self.allocator, reply_markup_json);
         try html_body.appendSlice(self.allocator, "}");
 
         const resp = self.api().sendMessage(self.allocator, html_body.items, "30") catch {
             // Network error — fall through to plain send
-            return try self.sendChunkPlainWithMarkup(chat_id, text, reply_to, reply_markup_json);
+            return try self.sendChunkPlainWithMarkup(target, text, reply_to, reply_markup_json);
         };
         defer self.allocator.free(resp);
 
         // Check if response indicates error (contains "error_code")
         if (telegram_api.responseHasTelegramError(resp)) {
             // HTML failed, retry as plain text
-            return try self.sendChunkPlainWithMarkup(chat_id, text, reply_to, reply_markup_json);
+            return try self.sendChunkPlainWithMarkup(target, text, reply_to, reply_markup_json);
         }
 
         return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
     }
 
-    fn sendWithMarkdownFallback(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
-        _ = try self.sendWithMarkdownFallbackWithMarkup(chat_id, text, reply_to, null);
+    fn sendWithMarkdownFallback(self: *TelegramChannel, target: []const u8, text: []const u8, reply_to: ?i64) !void {
+        _ = try self.sendWithMarkdownFallbackWithMarkup(target, text, reply_to, null);
     }
 
     fn outgoingChunkSplitLimit(text_len: usize, split_limit_override: ?usize) usize {
@@ -1236,13 +1527,13 @@ pub const TelegramChannel = struct {
 
     fn sendSplitTextWithMarkdownFallbackWithMarkup(
         self: *TelegramChannel,
-        chat_id: []const u8,
+        target: []const u8,
         text: []const u8,
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
         return self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
-            chat_id,
+            target,
             text,
             reply_to,
             reply_markup_json,
@@ -1252,7 +1543,7 @@ pub const TelegramChannel = struct {
 
     fn sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
         self: *TelegramChannel,
-        chat_id: []const u8,
+        target: []const u8,
         text: []const u8,
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
@@ -1271,7 +1562,7 @@ pub const TelegramChannel = struct {
         for (chunks, 0..) |chunk, i| {
             const is_last = i == chunks.len - 1;
             if (is_last) {
-                last_meta = self.sendWithMarkdownFallbackWithMarkup(chat_id, chunk.body, current_reply_to, reply_markup_json) catch |err| switch (err) {
+                last_meta = self.sendWithMarkdownFallbackWithMarkup(target, chunk.body, current_reply_to, reply_markup_json) catch |err| switch (err) {
                     error.TelegramMessageTooLong => blk: {
                         const next_limit = nextAdaptiveSplitLimit(current_limit, chunk.body.len);
                         if (next_limit == 0 or next_limit >= chunk.body.len) {
@@ -1279,7 +1570,7 @@ pub const TelegramChannel = struct {
                             return err;
                         }
                         const meta = self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
-                            chat_id,
+                            target,
                             chunk.body,
                             current_reply_to,
                             reply_markup_json,
@@ -1296,7 +1587,7 @@ pub const TelegramChannel = struct {
                     },
                 };
             } else {
-                self.sendWithMarkdownFallback(chat_id, chunk.body, current_reply_to) catch |err| switch (err) {
+                self.sendWithMarkdownFallback(target, chunk.body, current_reply_to) catch |err| switch (err) {
                     error.TelegramMessageTooLong => {
                         const next_limit = nextAdaptiveSplitLimit(current_limit, chunk.body.len);
                         if (next_limit == 0 or next_limit >= chunk.body.len) {
@@ -1304,7 +1595,7 @@ pub const TelegramChannel = struct {
                             return err;
                         }
                         _ = self.sendSplitTextWithMarkdownFallbackWithMarkupAdaptive(
-                            chat_id,
+                            target,
                             chunk.body,
                             current_reply_to,
                             null,
@@ -1331,18 +1622,21 @@ pub const TelegramChannel = struct {
 
     fn sendChunkPlainWithMarkup(
         self: *TelegramChannel,
-        chat_id: []const u8,
+        target: []const u8,
         text: []const u8,
         reply_to: ?i64,
         reply_markup_json: ?[]const u8,
     ) !SentMessageMeta {
+        const parsed_target = parseTelegramTarget(target);
+
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
         try body_list.appendSlice(self.allocator, "{\"chat_id\":");
-        try body_list.appendSlice(self.allocator, chat_id);
+        try body_list.appendSlice(self.allocator, parsed_target.chat_id);
         try body_list.appendSlice(self.allocator, ",\"text\":");
         try root.json_util.appendJsonString(&body_list, self.allocator, text);
+        try telegram_api.appendMessageThreadId(&body_list, self.allocator, parsed_target.message_thread_id);
         try telegram_api.appendReplyTo(&body_list, self.allocator, reply_to);
         try telegram_api.appendRawReplyMarkup(&body_list, self.allocator, reply_markup_json);
         try body_list.appendSlice(self.allocator, "}");
@@ -1357,8 +1651,8 @@ pub const TelegramChannel = struct {
         return telegram_api.parseSentMessageMeta(self.allocator, resp) orelse .{};
     }
 
-    fn sendChunkPlain(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
-        _ = try self.sendChunkPlainWithMarkup(chat_id, text, reply_to, null);
+    fn sendChunkPlain(self: *TelegramChannel, target: []const u8, text: []const u8, reply_to: ?i64) !void {
+        _ = try self.sendChunkPlainWithMarkup(target, text, reply_to, null);
     }
 
     // ── Media sending ───────────────────────────────────────────────
@@ -1408,19 +1702,21 @@ pub const TelegramChannel = struct {
     /// Send any media type via curl multipart form POST.
     fn sendMediaMultipart(
         self: *TelegramChannel,
-        chat_id: []const u8,
+        target: []const u8,
         allocator: std.mem.Allocator,
         kind: AttachmentKind,
         file_path: []const u8,
         caption: ?[]const u8,
     ) !void {
+        const parsed_target = parseTelegramTarget(target);
         const resolved_file_path = try resolveAttachmentPath(allocator, file_path);
         defer resolved_file_path.deinit(allocator);
         const media_path = resolved_file_path.path;
         try self.api().postMultipart(
             allocator,
             kind.apiMethod(),
-            chat_id,
+            parsed_target.chat_id,
+            parsed_target.message_thread_id,
             kind.formField(),
             media_path,
             caption,
@@ -1432,70 +1728,21 @@ pub const TelegramChannel = struct {
     /// Send a message to a Telegram chat via the Bot API.
     /// Parses attachment markers, sends typing indicator, uses smart splitting
     /// with Markdown fallback.
-    pub fn sendMessage(self: *TelegramChannel, chat_id: []const u8, text: []const u8) !void {
-        return self.sendMessageWithReply(chat_id, text, null);
+    pub fn sendMessage(self: *TelegramChannel, target: []const u8, text: []const u8) !void {
+        return self.sendMessageWithReply(target, text, null);
     }
 
     pub fn sendAssistantMessageWithReply(
         self: *TelegramChannel,
-        chat_id: []const u8,
+        target: []const u8,
         owner_identity: []const u8,
         is_group: bool,
         text: []const u8,
         reply_to: ?i64,
     ) !void {
-        var parsed = try interaction_choices.parseAssistantChoices(self.allocator, text);
-        defer parsed.deinit(self.allocator);
-
-        const directive = parsed.choices;
-        if (directive == null or !self.interactive.enabled) {
-            return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
-        }
-
-        // v1 scope: interactive choices do not support attachment-marker payloads.
-        if (isAttachmentMarkerCandidate(parsed.visible_text)) {
-            return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
-        }
-
-        const token = self.nextInteractionToken() catch {
-            return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
-        };
-        defer self.allocator.free(token);
-
-        const keyboard_json = self.buildInlineKeyboardJson(directive.?, token) catch |err| {
-            if (err != error.CallbackDataTooLong) {
-                log.warn("telegram buildInlineKeyboardJson failed: {}", .{err});
-            }
-            return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
-        };
-        defer self.allocator.free(keyboard_json);
-
-        const sent = self.sendSplitTextWithMarkdownFallbackWithMarkup(chat_id, parsed.visible_text, reply_to, keyboard_json) catch |err| {
-            if (err == error.PartiallySent) {
-                log.warn("telegram interactive send partially succeeded; skipping full fallback to avoid duplicate chunks", .{});
-                return;
-            }
-            log.warn("telegram interactive send failed, falling back to plain send: {}", .{err});
-            return self.sendMessageWithReply(chat_id, parsed.visible_text, reply_to);
-        };
-
-        if (sent.message_id == null) {
-            log.warn("telegram interactive send succeeded but response had no message_id; buttons will not be tracked", .{});
-            return;
-        }
-
-        const enforce_owner = is_group and self.interactive.owner_only;
-        self.registerPendingInteraction(
-            token,
-            chat_id,
-            if (enforce_owner) owner_identity else null,
-            enforce_owner,
-            self.interactive.remove_on_click,
-            sent.message_id,
-            directive.?,
-        ) catch |err| {
-            log.warn("telegram registerPendingInteraction failed: {}", .{err});
-        };
+        var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, text, &.{}, true);
+        defer payload.deinit(self.allocator);
+        try self.sendRichMessageWithReply(target, owner_identity, is_group, payload.payload(), reply_to);
     }
 
     fn nextAdaptiveSplitLimit(current_limit: usize, text_len: usize) usize {
@@ -1516,37 +1763,104 @@ pub const TelegramChannel = struct {
     }
 
     /// Send a message with optional reply-to, continuation markers, and delay between chunks.
-    pub fn sendMessageWithReply(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to: ?i64) !void {
+    pub fn sendMessageWithReply(self: *TelegramChannel, target: []const u8, text: []const u8, reply_to: ?i64) !void {
+        var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, text, &.{}, false);
+        defer payload.deinit(self.allocator);
+        return self.sendRichMessageWithReply(target, "", false, payload.payload(), reply_to);
+    }
+
+    fn sendRichMessageWithReply(
+        self: *TelegramChannel,
+        target: []const u8,
+        owner_identity: []const u8,
+        is_group: bool,
+        payload: root.Channel.OutboundPayload,
+        reply_to: ?i64,
+    ) !void {
         // Send typing indicator (best-effort)
-        self.sendTypingIndicator(chat_id);
+        self.sendTypingIndicator(target);
 
-        // Parse attachment markers
-        const parsed = try parseAttachmentMarkers(self.allocator, text);
-        defer parsed.deinit(self.allocator);
+        if (payload.choices.len > 0 and payload.attachments.len == 0 and self.interactive.enabled) {
+            var directive = buildChoicesDirectiveFromPayload(self.allocator, payload.choices) catch |err| {
+                log.warn("telegram buildChoicesDirectiveFromPayload failed, falling back to plain send: {}", .{err});
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+            defer directive.deinit(self.allocator);
 
-        // Send remaining text (if any) with smart splitting
-        if (parsed.remaining_text.len > 0) {
-            _ = try self.sendSplitTextWithMarkdownFallbackWithMarkup(chat_id, parsed.remaining_text, reply_to, null);
+            const token = self.nextInteractionToken() catch {
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+            defer self.allocator.free(token);
+
+            const keyboard_json = self.buildInlineKeyboardJson(directive, token) catch |err| {
+                if (err != error.CallbackDataTooLong) {
+                    log.warn("telegram buildInlineKeyboardJson failed: {}", .{err});
+                }
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+            defer self.allocator.free(keyboard_json);
+
+            const sent = self.sendSplitTextWithMarkdownFallbackWithMarkup(target, payload.text, reply_to, keyboard_json) catch |err| {
+                if (err == error.PartiallySent) {
+                    log.warn("telegram interactive send partially succeeded; skipping full fallback to avoid duplicate chunks", .{});
+                    return;
+                }
+                log.warn("telegram interactive send failed, falling back to plain send: {}", .{err});
+                return self.sendStructuredPayload(target, payload, reply_to);
+            };
+
+            if (sent.message_id == null) {
+                log.warn("telegram interactive send succeeded but response had no message_id; buttons will not be tracked", .{});
+                return;
+            }
+
+            const enforce_owner = is_group and self.interactive.owner_only;
+            self.registerPendingInteraction(
+                token,
+                target,
+                if (enforce_owner) owner_identity else null,
+                enforce_owner,
+                self.interactive.remove_on_click,
+                sent.message_id,
+                directive,
+            ) catch |err| {
+                log.warn("telegram registerPendingInteraction failed: {}", .{err});
+            };
+            return;
         }
 
-        // Send attachments
-        for (parsed.attachments) |att| {
-            self.sendMediaMultipart(chat_id, self.allocator, att.kind, att.target, att.caption) catch |err| {
+        return self.sendStructuredPayload(target, payload, reply_to);
+    }
+
+    fn sendStructuredPayload(
+        self: *TelegramChannel,
+        target: []const u8,
+        payload: root.Channel.OutboundPayload,
+        reply_to: ?i64,
+    ) !void {
+        if (payload.text.len > 0) {
+            _ = try self.sendSplitTextWithMarkdownFallbackWithMarkup(target, payload.text, reply_to, null);
+        }
+
+        for (payload.attachments) |attachment| {
+            self.sendMediaMultipart(target, self.allocator, from_root_attachment_kind(attachment.kind), attachment.target, attachment.caption) catch |err| {
                 log.err("sendMediaMultipart failed: {}", .{err});
                 continue;
             };
         }
     }
 
-    fn sendChunk(self: *TelegramChannel, chat_id: []const u8, text: []const u8) !void {
+    fn sendChunk(self: *TelegramChannel, target: []const u8, text: []const u8) !void {
+        const parsed_target = parseTelegramTarget(target);
         // Build JSON body with escaped text
         var body_list: std.ArrayListUnmanaged(u8) = .empty;
         defer body_list.deinit(self.allocator);
 
         try body_list.appendSlice(self.allocator, "{\"chat_id\":");
-        try body_list.appendSlice(self.allocator, chat_id);
+        try body_list.appendSlice(self.allocator, parsed_target.chat_id);
         try body_list.appendSlice(self.allocator, ",\"text\":");
         try root.json_util.appendJsonString(&body_list, self.allocator, text);
+        try telegram_api.appendMessageThreadId(&body_list, self.allocator, parsed_target.message_thread_id);
         try body_list.appendSlice(self.allocator, "}");
 
         const resp = try self.api().sendMessage(self.allocator, body_list.items, "30");
@@ -1655,7 +1969,7 @@ pub const TelegramChannel = struct {
             allocator.free(final_content);
             return;
         };
-        const sender_dup = allocator.dupe(u8, chat.chat_id) catch {
+        const sender_dup = dupTelegramTarget(allocator, chat.chat_id, chat.message_thread_id) catch {
             allocator.free(final_content);
             allocator.free(id_dup);
             return;
@@ -2207,12 +2521,18 @@ pub const TelegramChannel = struct {
             return;
         }
 
+        const chat_target = dupTelegramTarget(allocator, chat.chat_id, chat.message_thread_id) catch {
+            self.answerCallbackQuery(cb_id, "Failed to resolve topic context");
+            return;
+        };
+        defer allocator.free(chat_target);
+
         const selection = self.consumeCallbackSelection(
             allocator,
             parsed_cb.token,
             parsed_cb.option_id,
             clicker.preferred_identity,
-            chat.chat_id,
+            chat_target,
         ) catch |err| {
             log.warn("telegram consumeCallbackSelection failed: {}", .{err});
             self.answerCallbackQuery(cb_id, "Failed to handle button");
@@ -2232,7 +2552,7 @@ pub const TelegramChannel = struct {
 
                 const id_dup = allocator.dupe(u8, clicker.preferred_identity) catch return;
                 errdefer allocator.free(id_dup);
-                const sender_dup = allocator.dupe(u8, chat.chat_id) catch {
+                const sender_dup = dupTelegramTarget(allocator, chat.chat_id, chat.message_thread_id) catch {
                     allocator.free(id_dup);
                     return;
                 };
@@ -2313,7 +2633,7 @@ pub const TelegramChannel = struct {
         } else |_| {}
 
         // Keep slash-command menu in sync when channel is started via manager/daemon.
-        self.setMyCommands();
+        self.syncCommandsMenu();
         // If getMe fails, we still start — healthCheck will report issues.
     }
 
@@ -2497,6 +2817,8 @@ pub const TelegramChannel = struct {
 
         if (self.shouldSkipDraftSend(chat_id, draft_id, now_ms)) return;
 
+        const parsed_target = parseTelegramTarget(chat_id);
+
         const preview_text = telegram_draft_presenter.buildTransportText(
             self.allocator,
             text,
@@ -2509,13 +2831,14 @@ pub const TelegramChannel = struct {
         defer body.deinit(self.allocator);
 
         body.appendSlice(self.allocator, "{\"chat_id\":") catch return;
-        body.appendSlice(self.allocator, chat_id) catch return;
+        body.appendSlice(self.allocator, parsed_target.chat_id) catch return;
         body.appendSlice(self.allocator, ",\"draft_id\":") catch return;
         var id_buf: [20]u8 = undefined;
         const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{draft_id}) catch return;
         body.appendSlice(self.allocator, id_str) catch return;
         body.appendSlice(self.allocator, ",\"text\":") catch return;
         root.json_util.appendJsonString(&body, self.allocator, preview_text) catch return;
+        telegram_api.appendMessageThreadId(&body, self.allocator, parsed_target.message_thread_id) catch return;
         body.appendSlice(self.allocator, "}") catch return;
 
         const resp = self.api().sendMessageDraft(self.allocator, body.items) catch |err| {
@@ -2604,16 +2927,16 @@ pub const TelegramChannel = struct {
         }
     }
 
-    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, _: []const []const u8) anyerror!void {
+    fn vtableSend(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
         const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
-        // Outbound dispatcher (cron/gateway) uses the generic channel vtable path.
-        // If the payload contains an nc_choices directive, route it through the
-        // assistant interactive send path so Telegram renders inline buttons.
-        if (std.mem.indexOf(u8, message, interaction_choices.START_TAG) != null) {
-            try self.sendAssistantMessageWithReply(target, "", false, message, null);
-            return;
-        }
-        try self.sendMessage(target, message);
+        var payload = try buildOwnedOutboundPayloadFromLegacy(self.allocator, message, media, true);
+        defer payload.deinit(self.allocator);
+        try self.sendRichMessageWithReply(target, "", false, payload.payload(), null);
+    }
+
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *TelegramChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichMessageWithReply(target, "", false, payload, null);
     }
 
     fn vtableName(ptr: *anyopaque) []const u8 {
@@ -2641,6 +2964,7 @@ pub const TelegramChannel = struct {
         .stop = &vtableStop,
         .send = &vtableSend,
         .sendEvent = &vtableSendEvent,
+        .sendRich = &vtableSendRich,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -3249,6 +3573,51 @@ test "telegram parseAttachmentMarkers FILE alias" {
 
     try std.testing.expectEqual(@as(usize, 1), parsed.attachments.len);
     try std.testing.expectEqual(AttachmentKind.document, parsed.attachments[0].kind);
+}
+
+test "telegram buildOwnedOutboundPayloadFromLegacy lifts choices into structured payload" {
+    var payload = try buildOwnedOutboundPayloadFromLegacy(
+        std.testing.allocator,
+        "Question?\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\",\"submit_text\":\"No\"}]}</nc_choices>",
+        &.{},
+        true,
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Question?", payload.text);
+    try std.testing.expectEqual(@as(usize, 0), payload.attachments.len);
+    try std.testing.expectEqual(@as(usize, 2), payload.choices.len);
+    try std.testing.expectEqualStrings("yes", payload.choices[0].id);
+    try std.testing.expectEqualStrings("No", payload.choices[1].label);
+}
+
+test "telegram buildOwnedOutboundPayloadFromLegacy suppresses choices when explicit media is present" {
+    var payload = try buildOwnedOutboundPayloadFromLegacy(
+        std.testing.allocator,
+        "Question?\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\",\"submit_text\":\"No\"}]}</nc_choices>",
+        &.{"/tmp/photo.png"},
+        true,
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Question?", payload.text);
+    try std.testing.expectEqual(@as(usize, 1), payload.attachments.len);
+    try std.testing.expectEqual(root.Channel.OutboundAttachmentKind.image, payload.attachments[0].kind);
+    try std.testing.expectEqual(@as(usize, 0), payload.choices.len);
+}
+
+test "telegram buildOwnedOutboundPayloadFromLegacy keeps choices disabled for plain send path" {
+    var payload = try buildOwnedOutboundPayloadFromLegacy(
+        std.testing.allocator,
+        "Question?\n<nc_choices>{\"v\":1,\"options\":[{\"id\":\"yes\",\"label\":\"Yes\",\"submit_text\":\"Yes\"},{\"id\":\"no\",\"label\":\"No\",\"submit_text\":\"No\"}]}</nc_choices>",
+        &.{},
+        false,
+    );
+    defer payload.deinit(std.testing.allocator);
+
+    try std.testing.expectEqualStrings("Question?", payload.text);
+    try std.testing.expectEqual(@as(usize, 0), payload.attachments.len);
+    try std.testing.expectEqual(@as(usize, 0), payload.choices.len);
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -4679,4 +5048,15 @@ test "nextAdaptiveSplitLimit halves toward minimum threshold" {
     try std.testing.expectEqual(@as(usize, 256), TelegramChannel.nextAdaptiveSplitLimit(400, 5000));
     try std.testing.expectEqual(@as(usize, 199), TelegramChannel.nextAdaptiveSplitLimit(400, 200));
     try std.testing.expectEqual(@as(usize, 0), TelegramChannel.nextAdaptiveSplitLimit(400, 1));
+}
+
+test "parseTelegramTarget extracts topic suffix" {
+    const parsed = parseTelegramTarget("-100123#topic:77");
+    try std.testing.expectEqualStrings("-100123", parsed.chat_id);
+    try std.testing.expectEqual(@as(?i64, 77), parsed.message_thread_id);
+}
+
+test "createForumTopicFromTarget rejects empty name" {
+    var ch = TelegramChannel.init(std.testing.allocator, "test-token", &.{}, &.{}, "allowlist");
+    try std.testing.expectError(error.InvalidTopicName, ch.createForumTopicFromTarget("-100123#topic:77", "   "));
 }

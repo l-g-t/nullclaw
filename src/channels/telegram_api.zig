@@ -5,6 +5,10 @@ pub const SentMessageMeta = struct {
     message_id: ?i64 = null,
 };
 
+pub const ForumTopicMeta = struct {
+    message_thread_id: i64,
+};
+
 pub const BotIdentity = struct {
     user_id: ?i64 = null,
     username: ?[]u8 = null,
@@ -43,7 +47,14 @@ pub const Client = struct {
 
     pub fn setMyCommands(self: Client, commands_json: []const u8) !void {
         const resp = try self.post(self.allocator, "setMyCommands", commands_json, "10");
-        self.allocator.free(resp);
+        defer self.allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
+    }
+
+    pub fn deleteMyCommands(self: Client, body_json: []const u8) !void {
+        const resp = try self.post(self.allocator, "deleteMyCommands", body_json, "10");
+        defer self.allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
     }
 
     pub fn deleteWebhookKeepPending(self: Client) !void {
@@ -72,12 +83,13 @@ pub const Client = struct {
         return next_offset;
     }
 
-    pub fn sendTypingIndicator(self: Client, chat_id: []const u8) !void {
+    pub fn sendTypingIndicator(self: Client, chat_id: []const u8, message_thread_id: ?i64) !void {
         var body: std.ArrayListUnmanaged(u8) = .empty;
         defer body.deinit(self.allocator);
 
         try body.appendSlice(self.allocator, "{\"chat_id\":");
         try body.appendSlice(self.allocator, chat_id);
+        try appendMessageThreadId(&body, self.allocator, message_thread_id);
         try body.appendSlice(self.allocator, ",\"action\":\"typing\"}");
 
         const resp = try self.post(self.allocator, "sendChatAction", body.items, "10");
@@ -115,6 +127,48 @@ pub const Client = struct {
 
         const resp = try self.post(self.allocator, "editMessageReplyMarkup", body.items, "10");
         self.allocator.free(resp);
+    }
+
+    pub fn setMessageReaction(self: Client, chat_id: []const u8, message_id: i64, emoji: ?[]const u8) !void {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        try body.appendSlice(self.allocator, "{\"chat_id\":");
+        try body.appendSlice(self.allocator, chat_id);
+
+        var msg_id_buf: [32]u8 = undefined;
+        const msg_id_str = try std.fmt.bufPrint(&msg_id_buf, "{d}", .{message_id});
+        try body.appendSlice(self.allocator, ",\"message_id\":");
+        try body.appendSlice(self.allocator, msg_id_str);
+        try body.appendSlice(self.allocator, ",\"reaction\":");
+        if (emoji) |value| {
+            try body.appendSlice(self.allocator, "[{\"type\":\"emoji\",\"emoji\":");
+            try root.json_util.appendJsonString(&body, self.allocator, value);
+            try body.appendSlice(self.allocator, "}]");
+        } else {
+            try body.appendSlice(self.allocator, "[]");
+        }
+        try body.appendSlice(self.allocator, ",\"is_big\":false}");
+
+        const resp = try self.post(self.allocator, "setMessageReaction", body.items, "10");
+        defer self.allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
+    }
+
+    pub fn createForumTopic(self: Client, allocator: std.mem.Allocator, chat_id: []const u8, name: []const u8) !ForumTopicMeta {
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(allocator);
+
+        try body.appendSlice(allocator, "{\"chat_id\":");
+        try body.appendSlice(allocator, chat_id);
+        try body.appendSlice(allocator, ",\"name\":");
+        try root.json_util.appendJsonString(&body, allocator, name);
+        try body.appendSlice(allocator, "}");
+
+        const resp = try self.post(allocator, "createForumTopic", body.items, "30");
+        defer allocator.free(resp);
+        if (responseHasTelegramError(resp)) return error.TelegramApiError;
+        return parseForumTopicMeta(allocator, resp) orelse error.InvalidResponse;
     }
 
     pub fn sendMessage(self: Client, allocator: std.mem.Allocator, body: []const u8, timeout: []const u8) ![]u8 {
@@ -167,6 +221,7 @@ pub const Client = struct {
         allocator: std.mem.Allocator,
         method: []const u8,
         chat_id: []const u8,
+        message_thread_id: ?i64,
         field_name: []const u8,
         media_path: []const u8,
         caption: ?[]const u8,
@@ -212,6 +267,17 @@ pub const Client = struct {
         argc += 1;
         argv_buf[argc] = chatid_arg;
         argc += 1;
+
+        var thread_arg_buf: [128]u8 = undefined;
+        if (message_thread_id) |thread_id| {
+            var thread_fbs = std.io.fixedBufferStream(&thread_arg_buf);
+            try thread_fbs.writer().print("message_thread_id={d}", .{thread_id});
+            argv_buf[argc] = "-F";
+            argc += 1;
+            argv_buf[argc] = thread_fbs.getWritten();
+            argc += 1;
+        }
+
         argv_buf[argc] = "-F";
         argc += 1;
         argv_buf[argc] = file_arg;
@@ -266,6 +332,15 @@ pub fn appendReplyTo(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Alloc
     }
 }
 
+pub fn appendMessageThreadId(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, message_thread_id: ?i64) !void {
+    if (message_thread_id) |thread_id| {
+        var thread_buf: [32]u8 = undefined;
+        const thread_str = std.fmt.bufPrint(&thread_buf, "{d}", .{thread_id}) catch unreachable;
+        try body.appendSlice(allocator, ",\"message_thread_id\":");
+        try body.appendSlice(allocator, thread_str);
+    }
+}
+
 pub fn appendRawReplyMarkup(body: *std.ArrayListUnmanaged(u8), allocator: std.mem.Allocator, reply_markup_json: ?[]const u8) !void {
     if (reply_markup_json) |rm| {
         try body.appendSlice(allocator, ",\"reply_markup\":");
@@ -312,6 +387,23 @@ pub fn parseSentMessageMeta(allocator: std.mem.Allocator, resp: []const u8) ?Sen
     const msg_id_val = result_val.object.get("message_id") orelse return .{};
     if (msg_id_val != .integer) return .{};
     return .{ .message_id = msg_id_val.integer };
+}
+
+pub fn parseForumTopicMeta(allocator: std.mem.Allocator, resp: []const u8) ?ForumTopicMeta {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    const ok_val = parsed.value.object.get("ok") orelse return null;
+    if (ok_val != .bool or !ok_val.bool) return null;
+
+    const result_val = parsed.value.object.get("result") orelse return null;
+    if (result_val != .object) return null;
+
+    const thread_id_val = result_val.object.get("message_thread_id") orelse return null;
+    if (thread_id_val != .integer or thread_id_val.integer <= 0) return null;
+
+    return .{ .message_thread_id = thread_id_val.integer };
 }
 
 fn parseBotIdentity(allocator: std.mem.Allocator, resp: []const u8) ?BotIdentity {
@@ -373,4 +465,12 @@ test "telegram api parseSentMessageMeta extracts message id" {
         "{\"ok\":true,\"result\":{\"message_id\":42}}",
     ) orelse return error.TestExpectedEqual;
     try std.testing.expectEqual(@as(?i64, 42), meta.message_id);
+}
+
+test "telegram api parseForumTopicMeta extracts message thread id" {
+    const meta = parseForumTopicMeta(
+        std.testing.allocator,
+        "{\"ok\":true,\"result\":{\"message_thread_id\":77}}",
+    ) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(i64, 77), meta.message_thread_id);
 }

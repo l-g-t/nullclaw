@@ -525,6 +525,26 @@ pub const LucidMemory = struct {
         return self.local.loadUsage(session_id);
     }
 
+    fn implSessionCountSessions(ptr: *anyopaque) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countSessions();
+    }
+
+    fn implSessionListSessions(ptr: *anyopaque, allocator: std.mem.Allocator, limit: usize, offset: usize) anyerror![]root.SessionInfo {
+        const self = castSelf(ptr);
+        return self.local.listSessions(allocator, limit, offset);
+    }
+
+    fn implSessionCountDetailedMessages(ptr: *anyopaque, session_id: []const u8) anyerror!u64 {
+        const self = castSelf(ptr);
+        return self.local.countDetailedMessages(session_id);
+    }
+
+    fn implSessionLoadMessagesDetailed(ptr: *anyopaque, allocator: std.mem.Allocator, session_id: []const u8, limit: usize, offset: usize) anyerror![]root.DetailedMessageEntry {
+        const self = castSelf(ptr);
+        return self.local.loadMessagesDetailed(allocator, session_id, limit, offset);
+    }
+
     const session_vtable = root.SessionStore.VTable{
         .saveMessage = &implSessionSaveMessage,
         .loadMessages = &implSessionLoadMessages,
@@ -532,6 +552,10 @@ pub const LucidMemory = struct {
         .clearAutoSaved = &implSessionClearAutoSaved,
         .saveUsage = &implSessionSaveUsage,
         .loadUsage = &implSessionLoadUsage,
+        .countSessions = &implSessionCountSessions,
+        .listSessions = &implSessionListSessions,
+        .countDetailedMessages = &implSessionCountDetailedMessages,
+        .loadMessagesDetailed = &implSessionLoadMessagesDetailed,
     };
 
     pub fn sessionStore(self: *Self) root.SessionStore {

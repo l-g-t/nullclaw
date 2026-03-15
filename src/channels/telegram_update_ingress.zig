@@ -16,6 +16,7 @@ pub const ChatContext = struct {
     chat_id: []const u8,
     is_group: bool,
     message_id: ?i64,
+    message_thread_id: ?i64 = null,
     media_group_id: ?[]const u8,
 };
 
@@ -68,6 +69,7 @@ pub fn messageChatContext(message: std.json.Value, scratch: *IdentityScratch) ?C
         else
             false,
         .message_id = integerField(message, "message_id"),
+        .message_thread_id = messageThreadId(message),
         .media_group_id = stringField(message, "media_group_id"),
     };
 }
@@ -158,6 +160,22 @@ fn integerField(value: std.json.Value, key: []const u8) ?i64 {
     return if (field == .integer) field.integer else null;
 }
 
+fn messageThreadId(message: std.json.Value) ?i64 {
+    if (integerField(message, "message_thread_id")) |thread_id| {
+        if (thread_id > 0) return thread_id;
+    }
+
+    const is_topic_message = blk: {
+        const field = objectField(message, "is_topic_message") orelse break :blk false;
+        break :blk field == .bool and field.bool;
+    };
+    if (!is_topic_message) return null;
+
+    const reply_to_message = objectField(message, "reply_to_message") orelse return null;
+    const reply_message_id = integerField(reply_to_message, "message_id") orelse return null;
+    return if (reply_message_id > 0) reply_message_id else null;
+}
+
 test "telegram update ingress parses user identity" {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
@@ -180,7 +198,7 @@ test "telegram update ingress parses chat context" {
     const parsed = try std.json.parseFromSlice(
         std.json.Value,
         std.testing.allocator,
-        \\{"chat":{"id":2002,"type":"group"},"message_id":42,"media_group_id":"mg-1"}
+        \\{"chat":{"id":2002,"type":"group"},"message_id":42,"message_thread_id":77,"media_group_id":"mg-1"}
     ,
         .{},
     );
@@ -191,7 +209,26 @@ test "telegram update ingress parses chat context" {
     try std.testing.expectEqualStrings("2002", chat.chat_id);
     try std.testing.expect(chat.is_group);
     try std.testing.expectEqual(@as(?i64, 42), chat.message_id);
+    try std.testing.expectEqual(@as(?i64, 77), chat.message_thread_id);
     try std.testing.expectEqualStrings("mg-1", chat.media_group_id.?);
+}
+
+test "telegram update ingress infers thread id from topic reply root" {
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        std.testing.allocator,
+        \\{"chat":{"id":2002,"type":"supergroup"},"message_id":43,"is_topic_message":true,"reply_to_message":{"message_id":77}}
+    ,
+        .{},
+    );
+    defer parsed.deinit();
+
+    var scratch: IdentityScratch = .{};
+    const chat = messageChatContext(parsed.value, &scratch) orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("2002", chat.chat_id);
+    try std.testing.expect(chat.is_group);
+    try std.testing.expectEqual(@as(?i64, 43), chat.message_id);
+    try std.testing.expectEqual(@as(?i64, 77), chat.message_thread_id);
 }
 
 test "telegram update ingress falls back from text to caption" {

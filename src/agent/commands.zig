@@ -86,7 +86,7 @@ const SlashCommandKind = enum {
 fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "new") or isSlashName(cmd, "reset")) return .new_reset;
     if (isSlashName(cmd, "restart")) return .restart;
-    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands")) return .help;
+    if (isSlashName(cmd, "help") or isSlashName(cmd, "commands") or isSlashName(cmd, "menu")) return .help;
     if (isSlashName(cmd, "status")) return .status;
     if (isSlashName(cmd, "whoami") or isSlashName(cmd, "id")) return .whoami;
     if (isSlashName(cmd, "model") or isSlashName(cmd, "models")) return .model;
@@ -104,7 +104,7 @@ fn classifySlashCommand(cmd: SlashCommand) SlashCommandKind {
     if (isSlashName(cmd, "context")) return .context;
     if (isSlashName(cmd, "export-session") or isSlashName(cmd, "export")) return .export_session;
     if (isSlashName(cmd, "session")) return .session;
-    if (isSlashName(cmd, "subagents")) return .subagents;
+    if (isSlashName(cmd, "subagents") or isSlashName(cmd, "tasks")) return .subagents;
     if (isSlashName(cmd, "agents")) return .agents;
     if (isSlashName(cmd, "focus")) return .focus;
     if (isSlashName(cmd, "unfocus")) return .unfocus;
@@ -275,6 +275,9 @@ fn invalidateSystemPromptCache(self: anytype) void {
     if (@hasField(@TypeOf(self.*), "system_prompt_has_conversation_context")) {
         self.system_prompt_has_conversation_context = false;
     }
+    if (@hasField(@TypeOf(self.*), "system_prompt_conversation_context_fingerprint")) {
+        self.system_prompt_conversation_context_fingerprint = null;
+    }
     if (@hasField(@TypeOf(self.*), "system_prompt_model_name")) {
         if (self.system_prompt_model_name) |model_name| self.allocator.free(model_name);
         self.system_prompt_model_name = null;
@@ -382,6 +385,13 @@ test "planTurnInput keeps unknown slash-prefixed text on llm path" {
 
 test "planTurnInput keeps known slash commands local-only" {
     const plan = planTurnInput("/help");
+    try std.testing.expect(!plan.clear_session);
+    try std.testing.expect(plan.invoke_local_handler);
+    try std.testing.expect(plan.llm_user_message == null);
+}
+
+test "planTurnInput keeps /menu on local-only path" {
+    const plan = planTurnInput("/menu");
     try std.testing.expect(!plan.clear_session);
     try std.testing.expect(plan.invoke_local_handler);
     try std.testing.expect(plan.llm_user_message == null);
@@ -1017,10 +1027,14 @@ fn clearSessionState(self: anytype) void {
 
 fn formatWhoAmI(self: anytype) ![]const u8 {
     const session_id = self.memory_session_id orelse "unknown";
+    const profile_name = if (@hasField(@TypeOf(self.*), "profile_name"))
+        self.profile_name orelse "default"
+    else
+        "default";
     return try std.fmt.allocPrint(
         self.allocator,
-        "Session: {s}\nModel: {s}",
-        .{ session_id, self.model_name },
+        "Session: {s}\nAgent profile: {s}\nModel: {s}",
+        .{ session_id, profile_name, self.model_name },
     );
 }
 
@@ -1198,8 +1212,12 @@ fn formatStatus(self: anytype) ![]const u8 {
     const activation_label = if (show_emojis) "📡 Activation" else "Activation";
     const send_label = if (show_emojis) "📤 Send" else "Send";
     const ttl_label = if (show_emojis) "⏰ Session TTL" else "Session TTL";
+    const tasks_label = if (show_emojis) "🧵 Tasks" else "Tasks";
 
     try w.print("{s}NullClaw {s}\n", .{ title_prefix, version.string });
+    if (@hasField(@TypeOf(self.*), "profile_name")) {
+        try w.print("Agent profile: {s}\n", .{self.profile_name orelse "default"});
+    }
     try w.print("{s}: {s}\n", .{ model_label, self.model_name });
     try w.print("{s}: {d} messages\n", .{ history_label, self.history.items.len });
     try w.print("{s}: {d}\n", .{ tokens_label, self.total_tokens });
@@ -1225,6 +1243,34 @@ fn formatStatus(self: anytype) ![]const u8 {
         try w.print("{s}: {d}s\n", .{ ttl_label, ttl });
     } else {
         try w.print("{s}: off\n", .{ttl_label});
+    }
+    if (findSubagentManager(self)) |manager| {
+        manager.mutex.lock();
+        defer manager.mutex.unlock();
+
+        var running: u32 = 0;
+        var completed: u32 = 0;
+        var failed: u32 = 0;
+        var visible: u32 = 0;
+
+        var it = manager.tasks.iterator();
+        while (it.next()) |entry| {
+            const state = entry.value_ptr.*;
+            if (!taskBelongsToCurrentSession(self, state)) continue;
+            visible += 1;
+            switch (state.status) {
+                .running => running += 1,
+                .completed => completed += 1,
+                .failed => failed += 1,
+            }
+        }
+
+        if (visible > 0) {
+            try w.print(
+                "{s}: running={d} completed={d} failed={d}\n",
+                .{ tasks_label, running, completed, failed },
+            );
+        }
     }
     return try out.toOwnedSlice(self.allocator);
 }

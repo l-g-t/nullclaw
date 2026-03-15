@@ -11,9 +11,12 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Config = @import("config.zig").Config;
+const fs_compat = @import("fs_compat.zig");
+const agent_routing = @import("agent_routing.zig");
 const agent_mod = @import("agent/root.zig");
 const Agent = agent_mod.Agent;
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
+const config_types = @import("config_types.zig");
 const providers = @import("providers/root.zig");
 const Provider = providers.Provider;
 const memory_mod = @import("memory/root.zig");
@@ -53,12 +56,51 @@ fn persistedAssistantReply(agent: *const Agent, response: []const u8) []const u8
     return last.content;
 }
 
+fn sessionAgentId(session_key: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, session_key, "agent:")) return null;
+    const rest = session_key["agent:".len..];
+    const sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
+    if (sep == 0) return null;
+    return rest[0..sep];
+}
+
+fn findProfileForSessionKey(config: *const Config, session_key: []const u8) ?config_types.NamedAgentConfig {
+    const normalized_agent_id = sessionAgentId(session_key) orelse return null;
+
+    for (config.agents) |agent_profile| {
+        var norm_buf: [64]u8 = undefined;
+        const normalized_name = agent_routing.normalizeId(&norm_buf, agent_profile.name);
+        if (std.mem.eql(u8, normalized_name, normalized_agent_id)) return agent_profile;
+    }
+
+    return null;
+}
+
+const SessionProviderContext = struct {
+    provider: Provider,
+    holder: ?providers.ProviderHolder = null,
+    owned_api_key: ?[]u8 = null,
+
+    fn deinit(self: *SessionProviderContext, allocator: Allocator) void {
+        if (self.holder) |*holder| {
+            holder.deinit();
+            self.holder = null;
+        }
+        if (self.owned_api_key) |key| {
+            allocator.free(key);
+            self.owned_api_key = null;
+        }
+    }
+};
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Session
 // ═══════════════════════════════════════════════════════════════════════════
 
 pub const Session = struct {
     agent: Agent,
+    provider_holder: ?providers.ProviderHolder = null,
+    owned_provider_api_key: ?[]u8 = null,
     created_at: i64,
     last_active: i64,
     last_consolidated: u64 = 0,
@@ -69,6 +111,8 @@ pub const Session = struct {
 
     pub fn deinit(self: *Session, allocator: Allocator) void {
         self.agent.deinit();
+        if (self.provider_holder) |*holder| holder.deinit();
+        if (self.owned_provider_api_key) |key| allocator.free(key);
         allocator.free(self.session_key);
     }
 };
@@ -147,18 +191,45 @@ pub const SessionManager = struct {
 
         // Create new session
         const owned_key = try self.allocator.dupe(u8, session_key);
-        errdefer self.allocator.free(owned_key);
+        var key_owned_by_session = false;
+        errdefer if (!key_owned_by_session) self.allocator.free(owned_key);
 
         const session = try self.allocator.create(Session);
-        errdefer self.allocator.destroy(session);
+        session.provider_holder = null;
+        session.owned_provider_api_key = null;
+        var session_initialized = false;
+        errdefer {
+            if (session_initialized) session.deinit(self.allocator);
+            self.allocator.destroy(session);
+        }
+        errdefer if (!session_initialized) {
+            if (session.provider_holder) |*holder| holder.deinit();
+            if (session.owned_provider_api_key) |key| self.allocator.free(key);
+        };
 
-        var agent = try Agent.fromConfig(
+        const agent_profile = findProfileForSessionKey(self.config, session_key);
+        var provider_ctx = try self.resolveProviderForSession(agent_profile);
+        errdefer provider_ctx.deinit(self.allocator);
+
+        session.* = undefined;
+        session.provider_holder = provider_ctx.holder;
+        session.owned_provider_api_key = provider_ctx.owned_api_key;
+        provider_ctx.holder = null;
+        provider_ctx.owned_api_key = null;
+
+        const session_provider = if (session.provider_holder) |*holder|
+            holder.provider()
+        else
+            provider_ctx.provider;
+
+        var agent = try Agent.fromConfigWithProfile(
             self.allocator,
             self.config,
-            self.provider,
+            session_provider,
             self.tools,
             self.mem,
             self.observer,
+            agent_profile,
         );
         agent.policy = self.policy;
         agent.session_store = self.session_store;
@@ -170,8 +241,12 @@ pub const SessionManager = struct {
             agent.usage_record_ctx = @ptrCast(self);
         }
 
+        const session_provider_holder = session.provider_holder;
+        const session_owned_provider_api_key = session.owned_provider_api_key;
         session.* = .{
             .agent = agent,
+            .provider_holder = session_provider_holder,
+            .owned_provider_api_key = session_owned_provider_api_key,
             .created_at = std.time.timestamp(),
             .last_active = std.time.timestamp(),
             .last_consolidated = 0,
@@ -180,8 +255,8 @@ pub const SessionManager = struct {
             .turn_running = std.atomic.Value(bool).init(false),
             .mutex = .{},
         };
-        // From here, session owns agent — must deinit on error.
-        errdefer session.agent.deinit();
+        key_owned_by_session = true;
+        session_initialized = true;
 
         // Restore persisted conversation history from session store
         if (self.session_store) |store| {
@@ -201,6 +276,39 @@ pub const SessionManager = struct {
 
         try self.sessions.put(self.allocator, owned_key, session);
         return session;
+    }
+
+    fn resolveProviderForSession(
+        self: *SessionManager,
+        agent_profile: ?config_types.NamedAgentConfig,
+    ) !SessionProviderContext {
+        const profile = agent_profile orelse return .{ .provider = self.provider };
+
+        var owned_api_key: ?[]u8 = null;
+        errdefer if (owned_api_key) |key| self.allocator.free(key);
+
+        const provider_api_key = profile.api_key orelse blk: {
+            owned_api_key = providers.resolveApiKeyFromConfig(
+                self.allocator,
+                profile.provider,
+                self.config.providers,
+            ) catch null;
+            break :blk owned_api_key;
+        };
+
+        var holder = providers.ProviderHolder.fromConfig(
+            self.allocator,
+            profile.provider,
+            provider_api_key,
+            self.config.getProviderBaseUrl(profile.provider),
+            self.config.getProviderNativeTools(profile.provider),
+            self.config.getProviderUserAgent(profile.provider),
+        );
+        return .{
+            .provider = holder.provider(),
+            .holder = holder,
+            .owned_api_key = owned_api_key,
+        };
     }
 
     const StreamAdapterCtx = struct {
@@ -308,7 +416,7 @@ pub const SessionManager = struct {
         defer if (file_needs_close) file.close();
 
         const now_ts = std.time.timestamp();
-        const stat = file.stat() catch return;
+        const stat = fs_compat.stat(file) catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
         const record_line = std.fmt.allocPrint(
@@ -395,7 +503,7 @@ pub const SessionManager = struct {
             session.agent.clearInterruptRequest();
         }
 
-        // Set conversation context for this turn (Signal-specific for now)
+        // Set conversation context for this turn.
         session.agent.conversation_context = conversation_context;
         defer session.agent.conversation_context = null;
 
@@ -481,6 +589,17 @@ pub const SessionManager = struct {
         }
     };
 
+    pub const SessionSnapshot = struct {
+        session_key: []u8,
+        last_active: i64,
+        turn_count: u64,
+        turn_running: bool,
+
+        pub fn deinit(self: *SessionSnapshot, allocator: Allocator) void {
+            allocator.free(self.session_key);
+        }
+    };
+
     /// Request interruption of a currently running turn for a session.
     /// Returns whether it was signaled and the active tool snapshot (if any).
     pub fn requestTurnInterrupt(self: *SessionManager, session_key: []const u8) InterruptRequestResult {
@@ -494,6 +613,127 @@ pub const SessionManager = struct {
             .requested = true,
             .active_tool = session.agent.snapshotActiveToolName(self.allocator) catch null,
         };
+    }
+
+    pub fn freeSessionSnapshots(allocator: Allocator, snapshots: []SessionSnapshot) void {
+        for (snapshots) |*snapshot| snapshot.deinit(allocator);
+        allocator.free(snapshots);
+    }
+
+    /// Snapshot active sessions for read-only status/reporting surfaces.
+    /// The returned slice owns duplicated session keys and must be freed with
+    /// `freeSessionSnapshots`.
+    pub fn snapshotSessions(self: *SessionManager, allocator: Allocator) ![]SessionSnapshot {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const count = self.sessions.count();
+        const snapshots = try allocator.alloc(SessionSnapshot, count);
+        errdefer allocator.free(snapshots);
+
+        var idx: usize = 0;
+        errdefer {
+            for (snapshots[0..idx]) |*snapshot| snapshot.deinit(allocator);
+        }
+
+        var it = self.sessions.iterator();
+        while (it.next()) |entry| {
+            const session = entry.value_ptr.*;
+            session.mutex.lock();
+            const last_active = session.last_active;
+            const turn_count = session.turn_count;
+            session.mutex.unlock();
+
+            snapshots[idx] = .{
+                .session_key = try allocator.dupe(u8, session.session_key),
+                .last_active = last_active,
+                .turn_count = turn_count,
+                .turn_running = session.turn_running.load(.acquire),
+            };
+            idx += 1;
+        }
+
+        return snapshots;
+    }
+
+    /// Best-effort migration from a legacy session key to a new canonical key.
+    /// Used for wire-format changes where we want future turns to land on the
+    /// canonical key without dropping persisted transcript or session-scoped memory.
+    pub fn migrateLegacySessionKey(self: *SessionManager, canonical_session_key: []const u8, legacy_session_key: ?[]const u8) void {
+        const legacy = legacy_session_key orelse return;
+        if (std.mem.eql(u8, canonical_session_key, legacy)) return;
+
+        self.migrateLiveSessionKey(canonical_session_key, legacy);
+        self.migrateStoredSessionTranscript(canonical_session_key, legacy);
+        self.migrateScopedMemoryEntries(canonical_session_key, legacy);
+    }
+
+    fn migrateLiveSessionKey(self: *SessionManager, canonical_session_key: []const u8, legacy_session_key: []const u8) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        if (self.sessions.contains(canonical_session_key)) return;
+        const legacy_session = self.sessions.get(legacy_session_key) orelse return;
+        if (legacy_session.turn_running.load(.acquire)) return;
+
+        const new_key = self.allocator.dupe(u8, canonical_session_key) catch return;
+        if (self.sessions.fetchRemove(legacy_session_key)) |entry| {
+            const session = entry.value;
+            const old_key = session.session_key;
+
+            session.session_key = new_key;
+            session.agent.memory_session_id = session.session_key;
+
+            self.sessions.put(self.allocator, session.session_key, session) catch {
+                session.session_key = old_key;
+                session.agent.memory_session_id = session.session_key;
+                self.sessions.put(self.allocator, old_key, session) catch {
+                    log.err("failed to restore live session after canonical key migration rollback", .{});
+                };
+                self.allocator.free(new_key);
+                return;
+            };
+
+            self.allocator.free(old_key);
+        } else {
+            self.allocator.free(new_key);
+        }
+    }
+
+    fn migrateStoredSessionTranscript(self: *SessionManager, canonical_session_key: []const u8, legacy_session_key: []const u8) void {
+        const store = self.session_store orelse return;
+
+        const legacy_messages = store.loadMessages(self.allocator, legacy_session_key) catch return;
+        defer memory_mod.freeMessages(self.allocator, legacy_messages);
+        const legacy_usage = store.loadUsage(legacy_session_key) catch null;
+
+        if (legacy_messages.len == 0 and legacy_usage == null) return;
+
+        const canonical_messages = store.loadMessages(self.allocator, canonical_session_key) catch return;
+        defer memory_mod.freeMessages(self.allocator, canonical_messages);
+        const canonical_usage = store.loadUsage(canonical_session_key) catch null;
+
+        if (canonical_messages.len > 0 or canonical_usage != null) return;
+
+        for (legacy_messages) |entry| {
+            store.saveMessage(canonical_session_key, entry.role, entry.content) catch return;
+        }
+        if (legacy_usage) |usage| {
+            store.saveUsage(canonical_session_key, usage) catch return;
+        }
+        store.clearMessages(legacy_session_key) catch return;
+    }
+
+    fn migrateScopedMemoryEntries(self: *SessionManager, canonical_session_key: []const u8, legacy_session_key: []const u8) void {
+        const mem = self.mem orelse return;
+
+        const legacy_entries = mem.list(self.allocator, null, legacy_session_key) catch return;
+        defer memory_mod.freeEntries(self.allocator, legacy_entries);
+        if (legacy_entries.len == 0) return;
+
+        for (legacy_entries) |entry| {
+            mem.store(entry.key, entry.content, entry.category, canonical_session_key) catch return;
+        }
     }
 
     /// Number of active sessions.
@@ -1113,6 +1353,78 @@ test "getOrCreate creates separate sessions for different keys" {
     try testing.expect(s1 != s2);
 }
 
+test "getOrCreate applies named agent profile from routed session key" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.default_provider = "openrouter";
+    cfg.agents = &.{
+        .{
+            .name = "Coder Agent",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+            .system_prompt = "You are a coding specialist.",
+            .temperature = 0.25,
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
+    try testing.expect(session.provider_holder != null);
+    try testing.expectEqualStrings("Coder Agent", session.agent.profile_name.?);
+    try testing.expectEqualStrings("qwen2.5-coder:14b", session.agent.model_name);
+    try testing.expectEqualStrings("ollama", session.agent.default_provider);
+    try testing.expectApproxEqAbs(@as(f64, 0.25), session.agent.temperature, 0.000001);
+    try testing.expectEqual(@as(usize, 0), session.agent.model_routes.len);
+}
+
+test "getOrCreate stores named agent provider interface from session-owned holder" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.default_provider = "openrouter";
+    cfg.agents = &.{
+        .{
+            .name = "Coder Agent",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:coder-agent:telegram:group:-100123");
+    try testing.expect(session.provider_holder != null);
+
+    var holder = &session.provider_holder.?;
+    const holder_provider = holder.provider();
+    try testing.expect(session.agent.provider.ptr == holder_provider.ptr);
+    try testing.expect(session.agent.provider.vtable == holder_provider.vtable);
+}
+
+test "getOrCreate falls back to default config for unknown routed agent id" {
+    var mock = MockProvider{ .response = "ok" };
+    var cfg = testConfig();
+    cfg.default_provider = "openrouter";
+    cfg.agents = &.{
+        .{
+            .name = "coder",
+            .provider = "ollama",
+            .model = "qwen2.5-coder:14b",
+        },
+    };
+
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("agent:missing:telegram:group:-100123");
+    try testing.expect(session.provider_holder == null);
+    try testing.expect(session.agent.profile_name == null);
+    try testing.expectEqualStrings("test/mock-model", session.agent.model_name);
+    try testing.expectEqualStrings("openrouter", session.agent.default_provider);
+}
+
 test "sessionCount reflects active sessions" {
     var mock = MockProvider{ .response = "ok" };
     const cfg = testConfig();
@@ -1126,6 +1438,108 @@ test "sessionCount reflects active sessions" {
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
     _ = try sm.getOrCreate("a"); // existing
     try testing.expectEqual(@as(usize, 2), sm.sessionCount());
+}
+
+test "snapshotSessions captures live session metadata" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const session = try sm.getOrCreate("telegram:main:-100123#topic:77");
+    session.mutex.lock();
+    session.last_active = 1234;
+    session.turn_count = 9;
+    session.mutex.unlock();
+    session.turn_running.store(true, .release);
+    defer session.turn_running.store(false, .release);
+
+    const snapshots = try sm.snapshotSessions(testing.allocator);
+    defer SessionManager.freeSessionSnapshots(testing.allocator, snapshots);
+
+    try testing.expectEqual(@as(usize, 1), snapshots.len);
+    try testing.expectEqualStrings("telegram:main:-100123#topic:77", snapshots[0].session_key);
+    try testing.expectEqual(@as(i64, 1234), snapshots[0].last_active);
+    try testing.expectEqual(@as(u64, 9), snapshots[0].turn_count);
+    try testing.expect(snapshots[0].turn_running);
+}
+
+test "migrateLegacySessionKey renames in-memory session to canonical key" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    const legacy = try sm.getOrCreate("agent:main:telegram:group:-100123#topic:77");
+    legacy.turn_count = 3;
+
+    sm.migrateLegacySessionKey("agent:main:telegram:group:-100123:thread:77", "agent:main:telegram:group:-100123#topic:77");
+
+    try testing.expectEqual(@as(usize, 1), sm.sessionCount());
+    try testing.expect(sm.sessions.get("agent:main:telegram:group:-100123#topic:77") == null);
+
+    const canonical = sm.sessions.get("agent:main:telegram:group:-100123:thread:77") orelse return error.TestExpectedEqual;
+    try testing.expect(canonical == legacy);
+    try testing.expectEqualStrings("agent:main:telegram:group:-100123:thread:77", canonical.session_key);
+    try testing.expect(canonical.agent.memory_session_id != null);
+    try testing.expectEqualStrings("agent:main:telegram:group:-100123:thread:77", canonical.agent.memory_session_id.?);
+    try testing.expectEqual(@as(u64, 3), canonical.turn_count);
+}
+
+test "migrateLegacySessionKey copies persisted transcript and usage to canonical key" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, null, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    const store = sqlite_mem.sessionStore();
+    try store.saveMessage("agent:main:telegram:group:-100123#topic:77", "user", "hello");
+    try store.saveMessage("agent:main:telegram:group:-100123#topic:77", "assistant", "world");
+    try store.saveUsage("agent:main:telegram:group:-100123#topic:77", 42);
+
+    sm.migrateLegacySessionKey("agent:main:telegram:group:-100123:thread:77", "agent:main:telegram:group:-100123#topic:77");
+
+    const canonical_msgs = try store.loadMessages(testing.allocator, "agent:main:telegram:group:-100123:thread:77");
+    defer memory_mod.freeMessages(testing.allocator, canonical_msgs);
+    try testing.expectEqual(@as(usize, 2), canonical_msgs.len);
+    try testing.expectEqualStrings("hello", canonical_msgs[0].content);
+    try testing.expectEqualStrings("world", canonical_msgs[1].content);
+    try testing.expectEqual(@as(?u64, 42), try store.loadUsage("agent:main:telegram:group:-100123:thread:77"));
+
+    const legacy_msgs = try store.loadMessages(testing.allocator, "agent:main:telegram:group:-100123#topic:77");
+    defer memory_mod.freeMessages(testing.allocator, legacy_msgs);
+    try testing.expectEqual(@as(usize, 0), legacy_msgs.len);
+    try testing.expectEqual(@as(?u64, null), try store.loadUsage("agent:main:telegram:group:-100123#topic:77"));
+}
+
+test "migrateLegacySessionKey reattaches session-scoped memory to canonical key" {
+    var mock = MockProvider{ .response = "ok" };
+    const cfg = testConfig();
+
+    var sqlite_mem = try memory_mod.SqliteMemory.init(testing.allocator, ":memory:");
+    defer sqlite_mem.deinit();
+    const mem = sqlite_mem.memory();
+
+    var sm = testSessionManagerWithMemory(testing.allocator, &mock, &cfg, mem, sqlite_mem.sessionStore());
+    defer sm.deinit();
+
+    try mem.store("autosave_user_1", "legacy memory", .conversation, "agent:main:telegram:group:-100123#topic:77");
+
+    sm.migrateLegacySessionKey("agent:main:telegram:group:-100123:thread:77", "agent:main:telegram:group:-100123#topic:77");
+
+    const migrated = try mem.get(testing.allocator, "autosave_user_1");
+    defer if (migrated) |entry| entry.deinit(testing.allocator);
+    try testing.expect(migrated != null);
+    try testing.expect(migrated.?.session_id != null);
+    try testing.expectEqualStrings("agent:main:telegram:group:-100123:thread:77", migrated.?.session_id.?);
+
+    const legacy_entries = try mem.list(testing.allocator, null, "agent:main:telegram:group:-100123#topic:77");
+    defer memory_mod.freeEntries(testing.allocator, legacy_entries);
+    try testing.expectEqual(@as(usize, 0), legacy_entries.len);
 }
 
 test "session has correct initial state" {
