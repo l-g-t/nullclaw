@@ -357,11 +357,27 @@ fn ensureAndroidBuildEnvironment(b: *std.Build) void {
     std.process.exit(1);
 }
 
+fn addEmbeddedWasm3(module: *std.Build.Module, b: *std.Build) void {
+    module.addIncludePath(b.path("vendor/wasm3/source"));
+
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_bind.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_code.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_compile.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_core.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_env.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_exec.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_function.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_info.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_module.c") });
+    module.addCSourceFile(.{ .file = b.path("vendor/wasm3/source/m3_parse.c") });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const is_wasi = target.result.os.tag == .wasi;
     const is_static = b.option(bool, "static", "Static build") orelse false;
+    const enable_embedded_wasm3 = b.option(bool, "embedded_wasm3", "Embed wasm3 runtime into nullclaw binary (default: true; use -Dembedded_wasm3=false to disable)") orelse true;
     const app_version = b.option([]const u8, "version", "Version string embedded in the binary") orelse "dev";
     const channels_raw = b.option(
         []const u8,
@@ -479,6 +495,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "enable_channel_nostr", enable_channel_nostr);
     build_options.addOption(bool, "enable_channel_web", enable_channel_web);
     build_options.addOption(bool, "enable_channel_max", enable_channel_max);
+    build_options.addOption(bool, "enable_embedded_wasm3", enable_embedded_wasm3);
     const build_options_module = build_options.createModule();
 
     // ---------- library module (importable by consumers) ----------
@@ -501,6 +518,9 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             });
             module.addImport("websocket", ws_dep.module("websocket"));
+        }
+        if (enable_embedded_wasm3) {
+            addEmbeddedWasm3(module, b);
         }
         break :blk module;
     };
