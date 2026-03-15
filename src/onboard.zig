@@ -1089,7 +1089,7 @@ fn promptChoice(out: *std.Io.Writer, buf: []u8, max: usize, default_idx: usize) 
 }
 
 pub const tunnel_options = [_][]const u8{ "none", "cloudflare", "ngrok", "tailscale" };
-pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous" };
+pub const autonomy_options = [_][]const u8{ "supervised", "autonomous", "fully_autonomous", "yolo" };
 pub const wizard_memory_backend_order = [_][]const u8{
     "hybrid",
     "sqlite",
@@ -2006,7 +2006,7 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
 
     // ── Step 6: Autonomy level ──
     try out.writeAll("  Step 6/8: Autonomy level\n");
-    try out.writeAll("    [1] supervised\n    [2] autonomous\n    [3] fully_autonomous\n");
+    try out.writeAll("    [1] supervised\n    [2] autonomous\n    [3] fully_autonomous\n    [4] yolo\n");
     try out.writeAll("  Choice [1]: ");
     const autonomy_idx = promptChoice(out, &input_buf, autonomy_options.len, 0) orelse {
         try out.writeAll("\n  Aborted.\n");
@@ -2028,6 +2028,12 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
         2 => {
             // "fully_autonomous": fully acts and does not hard-block high-risk commands.
             cfg.autonomy.level = .full;
+            cfg.autonomy.require_approval_for_medium_risk = false;
+            cfg.autonomy.block_high_risk_commands = false;
+        },
+        3 => {
+            // "yolo": bypasses all command-level policy checks.
+            cfg.autonomy.level = .yolo;
             cfg.autonomy.require_approval_for_medium_risk = false;
             cfg.autonomy.block_high_risk_commands = false;
         },
@@ -3740,11 +3746,12 @@ test "tunnel_options has 4 entries" {
     try std.testing.expectEqualStrings("tailscale", tunnel_options[3]);
 }
 
-test "autonomy_options has 3 entries" {
-    try std.testing.expect(autonomy_options.len == 3);
+test "autonomy_options has 4 entries" {
+    try std.testing.expect(autonomy_options.len == 4);
     try std.testing.expectEqualStrings("supervised", autonomy_options[0]);
     try std.testing.expectEqualStrings("autonomous", autonomy_options[1]);
     try std.testing.expectEqualStrings("fully_autonomous", autonomy_options[2]);
+    try std.testing.expectEqualStrings("yolo", autonomy_options[3]);
 }
 
 test "catalog_providers has entries" {
@@ -3795,10 +3802,11 @@ test "findChannelOptionIndex supports number and key" {
 test "wizard maps autonomy index to enum correctly" {
     // Verify the mapping used in runWizard
     const Config2 = @import("config.zig");
-    const mapping = [_]Config2.AutonomyLevel{ .supervised, .full, .full };
+    const mapping = [_]Config2.AutonomyLevel{ .supervised, .full, .full, .yolo };
     try std.testing.expect(mapping[0] == .supervised);
     try std.testing.expect(mapping[1] == .full);
     try std.testing.expect(mapping[2] == .full);
+    try std.testing.expect(mapping[3] == .yolo);
 }
 
 // ── New template tests ──────────────────────────────────────────

@@ -103,6 +103,7 @@ With the config above and `LD_LIBRARY_PATH=/opt/tools/usr/lib:/opt/tools/lib` se
 These settings significantly widen trust boundaries and should be used only in controlled environments:
 
 - `autonomy.level = "full"`
+- `autonomy.level = "yolo"`
 - `allowed_commands = ["*"]`
 - `allowed_paths = ["*"]`
 - `gateway.allow_public_bind = true`

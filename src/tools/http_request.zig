@@ -134,6 +134,8 @@ pub const HttpRequestTool = struct {
         if (builtin.is_test) {
             return ToolResult.fail("Network disabled in tests");
         }
+        var curl_stderr: ?[]u8 = null;
+        defer if (curl_stderr) |s| allocator.free(s);
 
         const status_result = runCurlRequestWithStatus(
             allocator,
@@ -144,12 +146,16 @@ pub const HttpRequestTool = struct {
             connect_host,
             custom_headers,
             body,
+            &curl_stderr,
             @intCast(self.max_response_size),
         ) catch |err| {
             if (err == error.CurlInterrupted) {
                 return ToolResult.fail("Interrupted by /stop");
             }
-            const msg = try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
+            const msg = if (curl_stderr) |stderr_msg|
+                try std.fmt.allocPrint(allocator, "HTTP request failed: {}\ncurl stderr: {s}", .{ err, stderr_msg })
+            else
+                try std.fmt.allocPrint(allocator, "HTTP request failed: {}", .{err});
             return ToolResult{ .success = false, .output = "", .error_msg = msg };
         };
         defer allocator.free(status_result.body);
@@ -158,8 +164,8 @@ pub const HttpRequestTool = struct {
         const success = status_code >= 200 and status_code < 300;
 
         // Build redacted headers display for custom request headers
-        const redacted = redactHeadersForDisplay(allocator, custom_headers) catch "";
-        defer if (redacted.len > 0) allocator.free(redacted);
+        const redacted = redactHeadersForDisplay(allocator, custom_headers) catch try allocator.dupe(u8, "");
+        defer allocator.free(redacted);
 
         const output = if (redacted.len > 0)
             try std.fmt.allocPrint(
@@ -229,8 +235,11 @@ fn runCurlRequestWithStatus(
     connect_host: []const u8,
     headers: []const [2][]const u8,
     body: ?[]const u8,
+    stderr_out: ?*?[]u8,
     max_response_size: usize,
 ) !http_util.HttpResponse {
+    if (stderr_out) |out| out.* = null;
+
     var argv_buf: [64][]const u8 = undefined;
     var argc: usize = 0;
     const reserved_tail_args: usize = if (body != null) 5 else 3;
@@ -295,7 +304,7 @@ fn runCurlRequestWithStatus(
     var child = std.process.Child.init(argv_buf[0..argc], allocator);
     child.stdin_behavior = if (body != null) .Pipe else .Ignore;
     child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Pipe;
 
     try child.spawn();
 
@@ -358,18 +367,51 @@ fn runCurlRequestWithStatus(
     };
     errdefer allocator.free(stdout);
 
+    const stderr_raw = if (child.stderr) |stderr_file|
+        stderr_file.readToEndAlloc(allocator, 16 * 1024) catch null
+    else
+        null;
+    defer if (stderr_raw) |buf| allocator.free(buf);
+
+    var stderr_copy: ?[]u8 = try duplicateTrimmedStderr(allocator, stderr_raw);
+    defer if (stderr_copy) |buf| allocator.free(buf);
+
     const term = child.wait() catch return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     switch (term) {
-        .Exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) return error.CurlFailed,
+        .Exited => |code| if (code != 0 and !(cancel_flag != null and cancel_flag.?.load(.acquire))) {
+            if (stderr_out) |out| {
+                out.* = stderr_copy;
+                stderr_copy = null;
+            }
+            return error.CurlFailed;
+        },
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
     if (cancel_flag != null and cancel_flag.?.load(.acquire)) return error.CurlInterrupted;
 
-    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse return error.CurlParseError;
+    const status_sep = std.mem.lastIndexOfScalar(u8, stdout, '\n') orelse {
+        if (stderr_out) |out| {
+            out.* = stderr_copy;
+            stderr_copy = null;
+        }
+        return error.CurlParseError;
+    };
     const status_raw = std.mem.trim(u8, stdout[status_sep + 1 ..], " \t\r\n");
-    if (status_raw.len != 3) return error.CurlParseError;
-    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch return error.CurlParseError;
+    if (status_raw.len != 3) {
+        if (stderr_out) |out| {
+            out.* = stderr_copy;
+            stderr_copy = null;
+        }
+        return error.CurlParseError;
+    }
+    const status_code = std.fmt.parseInt(u16, status_raw, 10) catch {
+        if (stderr_out) |out| {
+            out.* = stderr_copy;
+            stderr_copy = null;
+        }
+        return error.CurlParseError;
+    };
     const body_slice = stdout[0..status_sep];
     const response_body = try allocator.dupe(u8, body_slice);
     allocator.free(stdout);
@@ -378,6 +420,14 @@ fn runCurlRequestWithStatus(
         .status_code = status_code,
         .body = response_body,
     };
+}
+
+fn duplicateTrimmedStderr(allocator: std.mem.Allocator, raw: ?[]const u8) !?[]u8 {
+    const bytes = raw orelse return null;
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    const copied = try allocator.dupe(u8, trimmed);
+    return copied;
 }
 
 fn ensureTlsCaBundleLoaded(client: *std.http.Client) !void {
@@ -486,7 +536,7 @@ fn parseHeaders(allocator: std.mem.Allocator, headers_json: ?[]const u8) ![]cons
 /// Headers with names containing authorization, api-key, apikey, token, secret,
 /// or password (case-insensitive) get their values replaced with "***REDACTED***".
 fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]const u8) ![]const u8 {
-    if (headers.len == 0) return "";
+    if (headers.len == 0) return allocator.dupe(u8, "");
 
     var buf: std.ArrayList(u8) = .{};
     errdefer buf.deinit(allocator);
@@ -509,7 +559,8 @@ fn redactHeadersForDisplay(allocator: std.mem.Allocator, headers: []const [2][]c
 fn isSensitiveHeader(name: []const u8) bool {
     // Convert to lowercase for comparison
     var lower_buf: [256]u8 = undefined;
-    if (name.len > lower_buf.len) return false;
+    // Fail closed: oversized header names are treated as sensitive.
+    if (name.len > lower_buf.len) return true;
     const lower = lower_buf[0..name.len];
     for (name, 0..) |c, i| {
         lower[i] = std.ascii.toLower(c);
@@ -606,6 +657,7 @@ test "redactHeadersForDisplay redacts api-key and token" {
 
 test "redactHeadersForDisplay empty returns empty" {
     const result = try redactHeadersForDisplay(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("", result);
 }
 
@@ -616,6 +668,12 @@ test "isSensitiveHeader checks" {
     try std.testing.expect(isSensitiveHeader("password-header"));
     try std.testing.expect(!isSensitiveHeader("Content-Type"));
     try std.testing.expect(!isSensitiveHeader("Accept"));
+}
+
+test "isSensitiveHeader treats oversized names as sensitive" {
+    var long_name: [300]u8 = undefined;
+    @memset(long_name[0..], 'a');
+    try std.testing.expect(isSensitiveHeader(long_name[0..]));
 }
 
 test "http_request disables automatic redirects" {
@@ -819,6 +877,17 @@ test "buildHttpRequestErrorMessage includes TLS hint" {
     const msg = try buildHttpRequestErrorMessage(std.testing.allocator, "HTTP request failed", error.TlsInitializationFailed);
     defer std.testing.allocator.free(msg);
     try std.testing.expect(std.mem.indexOf(u8, msg, "system CA certificates") != null);
+}
+
+test "duplicateTrimmedStderr trims non-empty stderr" {
+    const copied = (try duplicateTrimmedStderr(std.testing.allocator, "\n curl: (6) Could not resolve host \n")).?;
+    defer std.testing.allocator.free(copied);
+    try std.testing.expectEqualStrings("curl: (6) Could not resolve host", copied);
+}
+
+test "duplicateTrimmedStderr ignores empty stderr" {
+    try std.testing.expect((try duplicateTrimmedStderr(std.testing.allocator, "  \n\t  ")) == null);
+    try std.testing.expect((try duplicateTrimmedStderr(std.testing.allocator, null)) == null);
 }
 
 // ── parseHeaders tests ──────────────────────────────────────

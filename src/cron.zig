@@ -1049,7 +1049,13 @@ fn runAgentJob(
         child.cwd = exec_cwd;
 
         child.spawn() catch |err| switch (err) {
-            error.FileNotFound => {
+            error.FileNotFound,
+            // On macOS the kernel returns ENOEXEC (InvalidExe) when the on-disk
+            // binary was replaced while the gateway was running (in-place rebuild
+            // or redeploy).  Treat it identically to FileNotFound so we fall
+            // through to the PATH-based fallback below.
+            error.InvalidExe,
+            => {
                 // If cwd disappeared, retry from process cwd.
                 if (exec_cwd != null and !tried_no_cwd) {
                     exec_cwd = null;
