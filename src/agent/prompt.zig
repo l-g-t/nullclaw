@@ -510,6 +510,16 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
     return try buf.toOwnedSlice(allocator);
 }
 
+/// Allocating wrapper around appendSkillsSection for callers that need
+/// skill guidance as a standalone string (e.g. subagent runner).
+pub fn buildSkillsSection(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, workspace_dir);
+    return try buf.toOwnedSlice(allocator);
+}
+
 fn writeXmlEscapedAttrValue(w: anytype, value: []const u8) !void {
     for (value) |c| {
         switch (c) {
@@ -1560,6 +1570,13 @@ test "appendSkillsSection with no skills produces nothing" {
     try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills");
 
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "buildSkillsSection with no skills returns empty" {
+    const allocator = std.testing.allocator;
+    const content = try buildSkillsSection(allocator, "/tmp/nullclaw-prompt-test-no-skills-wrapper");
+    defer allocator.free(content);
+    try std.testing.expectEqual(@as(usize, 0), content.len);
 }
 
 test "appendSkillsSection renders summary XML for always=false skill" {

@@ -127,11 +127,21 @@ pub fn runTaskWithTools(
     const tool_instructions = try agent_mod.prompt.buildToolInstructions(allocator, tools);
     defer allocator.free(tool_instructions);
 
-    const full_system = try std.fmt.allocPrint(
-        allocator,
-        "{s}\n\n{s}",
-        .{ request.system_prompt, tool_instructions },
-    );
+    const skills_section = try agent_mod.prompt.buildSkillsSection(allocator, request.workspace_dir);
+    defer allocator.free(skills_section);
+
+    const full_system = if (skills_section.len > 0)
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n{s}{s}",
+            .{ request.system_prompt, skills_section, tool_instructions },
+        )
+    else
+        try std.fmt.allocPrint(
+            allocator,
+            "{s}\n\n{s}",
+            .{ request.system_prompt, tool_instructions },
+        );
     errdefer allocator.free(full_system);
 
     try agent.history.append(allocator, .{
