@@ -1,5 +1,6 @@
 const std = @import("std");
 const search_base_url = @import("search_base_url.zig");
+const tunnel_mod = @import("tunnel.zig");
 
 /// Default context token budget used by agent compaction/context management.
 /// Runtime fallback (`DEFAULT_CONTEXT_TOKENS`).
@@ -260,6 +261,45 @@ pub const TelegramInteractiveConfig = struct {
     remove_on_click: bool = true,
 };
 
+pub const TelegramReactionEmojisConfig = struct {
+    accepted: []const u8 = "👀",
+    running: []const u8 = "⚡",
+    done: []const u8 = "👍",
+    failed: []const u8 = "💔",
+};
+
+pub const TelegramCommandsMenuMode = enum {
+    off,
+    flat,
+    scoped,
+};
+
+pub const MaxListenerMode = enum {
+    polling,
+    webhook,
+};
+
+pub const MaxInteractiveConfig = struct {
+    enabled: bool = false,
+    ttl_secs: u64 = 900,
+    owner_only: bool = true,
+};
+
+pub const MaxConfig = struct {
+    account_id: []const u8 = "default",
+    bot_token: []const u8,
+    allow_from: []const []const u8 = &.{},
+    group_allow_from: []const []const u8 = &.{},
+    group_policy: []const u8 = "allowlist",
+    proxy: ?[]const u8 = null,
+    mode: MaxListenerMode = .polling,
+    webhook_url: ?[]const u8 = null,
+    webhook_secret: ?[]const u8 = null,
+    interactive: MaxInteractiveConfig = .{},
+    require_mention: bool = false,
+    streaming: bool = true,
+};
+
 pub const TelegramConfig = struct {
     account_id: []const u8 = "default",
     bot_token: []const u8,
@@ -275,6 +315,19 @@ pub const TelegramConfig = struct {
     require_mention: bool = false,
     /// Stream partial responses to users via sendMessageDraft before the final message.
     streaming: bool = true,
+    /// Show task lifecycle on the triggering user message via Telegram reactions.
+    status_reactions: bool = false,
+    /// Per-state reaction emoji overrides. Empty string clears the reaction for that state.
+    reaction_emojis: TelegramReactionEmojisConfig = .{},
+    /// Enable Telegram-specific binding commands such as /bind.
+    binding_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic management commands such as /topic.
+    topic_commands_enabled: bool = true,
+    /// Enable Telegram-specific topic/session map command such as /topics.
+    topic_map_command_enabled: bool = true,
+    /// Publish Telegram slash-command menu:
+    /// off = clear it, flat = one global list, scoped = separate private/group menus.
+    commands_menu_mode: TelegramCommandsMenuMode = .flat,
 };
 
 pub const DiscordConfig = struct {
@@ -312,6 +365,17 @@ pub const SlackConfig = struct {
     dm_policy: []const u8 = "pairing",
     group_policy: []const u8 = "mention_only",
     reply_to_mode: SlackReplyToMode = .off,
+};
+
+pub const TeamsConfig = struct {
+    account_id: []const u8 = "default",
+    client_id: []const u8,
+    client_secret: []const u8,
+    tenant_id: []const u8,
+    webhook_secret: ?[]const u8 = null,
+    notification_channel_id: ?[]const u8 = null,
+    bot_id: ?[]const u8 = null,
+    config_dir: []const u8 = ".",
 };
 
 pub const WebhookConfig = struct {
@@ -400,6 +464,8 @@ pub const DingTalkConfig = struct {
     client_id: []const u8,
     client_secret: []const u8,
     allow_from: []const []const u8 = &.{},
+    ai_card_template_id: ?[]const u8 = null,
+    ai_card_streaming_key: ?[]const u8 = null,
 };
 
 pub const SignalConfig = struct {
@@ -479,6 +545,7 @@ pub const WebConfig = struct {
     pub const DEFAULT_PATH: []const u8 = "/ws";
     pub const DEFAULT_TRANSPORT: []const u8 = "local";
     pub const DEFAULT_MESSAGE_AUTH_MODE: []const u8 = "pairing";
+    pub const DEFAULT_MAX_HANDSHAKE_SIZE: u16 = 8_192;
     pub const MIN_AUTH_TOKEN_LEN: usize = 16;
     pub const MAX_AUTH_TOKEN_LEN: usize = 128;
     pub const MAX_RELAY_AGENT_ID_LEN: usize = 64;
@@ -497,6 +564,9 @@ pub const WebConfig = struct {
     listen: []const u8 = "127.0.0.1",
     path: []const u8 = DEFAULT_PATH,
     max_connections: u16 = 10,
+    /// Max bytes allowed for the HTTP upgrade request headers during WS handshake.
+    /// Increase this when running behind reverse proxies that append many headers.
+    max_handshake_size: u16 = DEFAULT_MAX_HANDSHAKE_SIZE,
     /// Optional WebSocket-upgrade auth token for browser/extension clients.
     /// Used for WebSocket-upgrade hardening and for `message_auth_mode="token"`.
     /// If null, WebChannel falls back to env (NULLCLAW_WEB_TOKEN/NULLCLAW_GATEWAY_TOKEN/OPENCLAW_GATEWAY_TOKEN),
@@ -687,6 +757,7 @@ pub const ChannelsConfig = struct {
     matrix: []const MatrixConfig = &.{},
     mattermost: []const MattermostConfig = &.{},
     whatsapp: []const WhatsAppConfig = &.{},
+    teams: []const TeamsConfig = &.{},
     irc: []const IrcConfig = &.{},
     lark: []const LarkConfig = &.{},
     dingtalk: []const DingTalkConfig = &.{},
@@ -697,6 +768,7 @@ pub const ChannelsConfig = struct {
     onebot: []const OneBotConfig = &.{},
     maixcam: []const MaixCamConfig = &.{},
     web: []const WebConfig = &.{},
+    max: []const MaxConfig = &.{},
     nostr: ?*NostrConfig = null,
 
     fn primaryAccount(comptime T: type, items: []const T) ?T {
@@ -738,6 +810,9 @@ pub const ChannelsConfig = struct {
     pub fn whatsappPrimary(self: *const ChannelsConfig) ?WhatsAppConfig {
         return primaryAccount(WhatsAppConfig, self.whatsapp);
     }
+    pub fn teamsPrimary(self: *const ChannelsConfig) ?TeamsConfig {
+        return primaryAccount(TeamsConfig, self.teams);
+    }
     pub fn ircPrimary(self: *const ChannelsConfig) ?IrcConfig {
         return primaryAccount(IrcConfig, self.irc);
     }
@@ -764,6 +839,9 @@ pub const ChannelsConfig = struct {
     }
     pub fn webPrimary(self: *const ChannelsConfig) ?WebConfig {
         return primaryAccount(WebConfig, self.web);
+    }
+    pub fn maxPrimary(self: *const ChannelsConfig) ?MaxConfig {
+        return primaryAccount(MaxConfig, self.max);
     }
 };
 
@@ -1063,9 +1141,13 @@ pub const MemorySummarizerConfig = struct {
 
 // ── Tunnel config ───────────────────────────────────────────────
 
-pub const TunnelConfig = struct {
-    provider: []const u8 = "none",
-};
+// Re-export tunnel config types from tunnel.zig so config parsing stays
+// aligned with the runtime tunnel factory shape.
+pub const CloudflareTunnelConfig = tunnel_mod.CloudflareTunnelConfig;
+pub const TailscaleTunnelConfig = tunnel_mod.TailscaleTunnelConfig;
+pub const NgrokTunnelConfig = tunnel_mod.NgrokTunnelConfig;
+pub const CustomTunnelConfig = tunnel_mod.CustomTunnelConfig;
+pub const TunnelConfig = tunnel_mod.TunnelFullConfig;
 
 // ── Gateway config ──────────────────────────────────────────────
 
@@ -1078,6 +1160,16 @@ pub const GatewayConfig = struct {
     webhook_rate_limit_per_minute: u32 = 60,
     idempotency_ttl_secs: u64 = 300,
     paired_tokens: []const []const u8 = &.{},
+};
+
+// ── A2A (Agent-to-Agent) protocol config ────────────────────────
+
+pub const A2aConfig = struct {
+    enabled: bool = false,
+    name: []const u8 = "NullClaw",
+    description: []const u8 = "AI assistant",
+    url: []const u8 = "",
+    version: []const u8 = "1.0.0",
 };
 
 // ── Composio config ─────────────────────────────────────────────
@@ -1310,6 +1402,8 @@ pub const NamedAgentConfig = struct {
     provider: []const u8,
     model: []const u8,
     system_prompt: ?[]const u8 = null,
+    /// Runtime-only source path preserved so Config.save() can round-trip file-backed prompts.
+    system_prompt_path: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
     temperature: ?f64 = null,
     max_depth: u32 = 3,
@@ -1374,6 +1468,7 @@ test "WebConfig defaults" {
     try std.testing.expectEqualStrings("127.0.0.1", cfg.listen);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, cfg.path);
     try std.testing.expectEqual(@as(u16, 10), cfg.max_connections);
+    try std.testing.expectEqual(WebConfig.DEFAULT_MAX_HANDSHAKE_SIZE, cfg.max_handshake_size);
     try std.testing.expect(cfg.auth_token == null);
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_MESSAGE_AUTH_MODE, cfg.message_auth_mode);
     try std.testing.expectEqual(@as(usize, 0), cfg.allowed_origins.len);

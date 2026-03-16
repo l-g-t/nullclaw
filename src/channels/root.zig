@@ -64,6 +64,11 @@ pub const Channel = struct {
 
     pub const OutboundStage = streaming.OutboundStage;
 
+    pub const OutboundAttachmentKind = outbound.AttachmentKind;
+    pub const OutboundAttachment = outbound.Attachment;
+    pub const OutboundChoice = outbound.Choice;
+    pub const OutboundPayload = outbound.Payload;
+
     fn defaultStartTyping(_: *anyopaque, _: []const u8) anyerror!void {}
     fn defaultStopTyping(_: *anyopaque, _: []const u8) anyerror!void {}
 
@@ -87,9 +92,13 @@ pub const Channel = struct {
             media: []const []const u8,
             stage: OutboundStage,
         ) anyerror!void = null,
-        /// Optional rich-message delivery (cards, buttons, sections).
-        /// If null, Channel.sendRich() falls back to Payload.toPlainText() + send().
-        sendRich: ?*const fn (ptr: *anyopaque, target: []const u8, payload: OutboundPayload) anyerror!void = null,
+        /// Optional structured outbound delivery for channels that support
+        /// richer semantics than raw text + generic media paths.
+        sendRich: ?*const fn (
+            ptr: *anyopaque,
+            target: []const u8,
+            payload: outbound.Payload,
+        ) anyerror!void = null,
         /// Start processing indicator for a recipient (e.g., typing status).
         startTyping: *const fn (ptr: *anyopaque, recipient: []const u8) anyerror!void = &defaultStartTyping,
         /// Stop processing indicator for a recipient.
@@ -131,12 +140,11 @@ pub const Channel = struct {
         return self.vtable.stopTyping(self.ptr, recipient);
     }
 
-    /// Send a rich card payload. If the channel implements sendRich, delegates to it.
-    /// Otherwise renders the payload to plain text and calls send().
-    pub fn sendRich(self: Channel, allocator: std.mem.Allocator, target: []const u8, payload: OutboundPayload) !void {
+    pub fn sendRich(self: Channel, allocator: std.mem.Allocator, target: []const u8, payload: outbound.Payload) !void {
         if (self.vtable.sendRich) |fn_rich| {
             return fn_rich(self.ptr, target, payload);
         }
+        if (payload.attachments.len > 0) return error.NotSupported;
         const text = try payload.toPlainText(allocator);
         defer allocator.free(text);
         return self.send(target, text, &.{});
@@ -152,6 +160,7 @@ pub const telegram = @import("telegram.zig");
 pub const discord = @import("discord.zig");
 pub const slack = @import("slack.zig");
 pub const whatsapp = @import("whatsapp.zig");
+pub const teams = @import("teams.zig");
 pub const matrix = @import("matrix.zig");
 pub const mattermost = @import("mattermost.zig");
 pub const irc = @import("irc.zig");
@@ -178,6 +187,22 @@ else
             }
             pub fn setBus(_: *@This(), _: anytype) void {}
         };
+    };
+pub const max = if (@import("build_options").enable_channel_max)
+    @import("max.zig")
+else
+    struct {
+        pub const MaxChannel = struct {
+            pub fn initFromConfig(_: @import("std").mem.Allocator, _: anytype) @This() {
+                return .{};
+            }
+            pub fn channel(_: *@This()) Channel {
+                unreachable;
+            }
+            pub fn setBus(_: *@This(), _: anytype) void {}
+        };
+
+        pub fn setInteractiveOwnerContext(_: ?[]const u8) void {}
     };
 pub const dispatch = @import("dispatch.zig");
 
@@ -713,6 +738,91 @@ test "GroupPolicy enum values" {
     try std.testing.expect(@intFromEnum(GroupPolicy.open) != @intFromEnum(GroupPolicy.mention_only));
     try std.testing.expect(@intFromEnum(GroupPolicy.mention_only) != @intFromEnum(GroupPolicy.allowlist));
     try std.testing.expect(@intFromEnum(GroupPolicy.open) != @intFromEnum(GroupPolicy.allowlist));
+}
+
+test "Channel sendRich falls back to send for plain text payload" {
+    const Mock = struct {
+        sent_target: ?[]const u8 = null,
+        sent_text: ?[]const u8 = null,
+
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(ptr: *anyopaque, target: []const u8, message: []const u8, media: []const []const u8) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 0), media.len);
+            self.sent_target = target;
+            self.sent_text = try std.testing.allocator.dupe(u8, message);
+        }
+        fn name(_: *anyopaque) []const u8 {
+            return "mock";
+        }
+        fn health(_: *anyopaque) bool {
+            return true;
+        }
+
+        const vtable = Channel.VTable{
+            .start = &start,
+            .stop = &stop,
+            .send = &send,
+            .name = &name,
+            .healthCheck = &health,
+        };
+    };
+
+    var mock = Mock{};
+    defer if (mock.sent_text) |text| std.testing.allocator.free(text);
+    const channel = Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
+    try channel.sendRich(std.testing.allocator, "chat-1", .{ .text = "ola" });
+    try std.testing.expectEqualStrings("chat-1", mock.sent_target.?);
+    try std.testing.expectEqualStrings("ola\n", mock.sent_text.?);
+}
+
+test "Channel sendRich prefers structured vtable when available" {
+    const Mock = struct {
+        rich_target: ?[]const u8 = null,
+        rich_text: ?[]const u8 = null,
+        rich_attachment_count: usize = 0,
+
+        fn start(_: *anyopaque) anyerror!void {}
+        fn stop(_: *anyopaque) void {}
+        fn send(_: *anyopaque, _: []const u8, _: []const u8, _: []const []const u8) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+        fn sendRich(ptr: *anyopaque, target: []const u8, payload: Channel.OutboundPayload) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.rich_target = target;
+            self.rich_text = payload.text;
+            self.rich_attachment_count = payload.attachments.len;
+        }
+        fn name(_: *anyopaque) []const u8 {
+            return "mock";
+        }
+        fn health(_: *anyopaque) bool {
+            return true;
+        }
+
+        const vtable = Channel.VTable{
+            .start = &start,
+            .stop = &stop,
+            .send = &send,
+            .sendRich = &sendRich,
+            .name = &name,
+            .healthCheck = &health,
+        };
+    };
+
+    var mock = Mock{};
+    const channel = Channel{ .ptr = @ptrCast(&mock), .vtable = &Mock.vtable };
+    const attachments = [_]Channel.OutboundAttachment{
+        .{ .kind = .image, .target = "/tmp/photo.png" },
+    };
+    try channel.sendRich(std.testing.allocator, "chat-2", .{
+        .text = "foto",
+        .attachments = &attachments,
+    });
+    try std.testing.expectEqualStrings("chat-2", mock.rich_target.?);
+    try std.testing.expectEqualStrings("foto", mock.rich_text.?);
+    try std.testing.expectEqual(@as(usize, 1), mock.rich_attachment_count);
 }
 
 test {

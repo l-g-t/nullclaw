@@ -2,6 +2,8 @@ const std = @import("std");
 const types = @import("config_types.zig");
 const agent_routing = @import("agent_routing.zig");
 
+const log = std.log.scoped(.config);
+
 // Forward-reference to the Config struct defined in config.zig.
 // Zig handles circular @import lazily, so this works as long as there is
 // no comptime-initialization cycle.
@@ -32,6 +34,15 @@ const PrimaryModelRef = struct {
     provider: []const u8,
     model: []const u8,
 };
+
+fn freeNamedAgentConfig(allocator: std.mem.Allocator, agent_cfg: *types.NamedAgentConfig) void {
+    allocator.free(agent_cfg.name);
+    allocator.free(agent_cfg.provider);
+    allocator.free(agent_cfg.model);
+    if (agent_cfg.system_prompt) |system_prompt| allocator.free(system_prompt);
+    if (agent_cfg.system_prompt_path) |system_prompt_path| allocator.free(system_prompt_path);
+    if (agent_cfg.api_key) |api_key| allocator.free(api_key);
+}
 
 fn splitPrimaryModelRef(primary: []const u8) ?PrimaryModelRef {
     // Handle custom: prefix specially (e.g., "custom:https://example.com/v2/model")
@@ -127,8 +138,32 @@ fn parseNamedAgentObject(
         .provider = try allocator.dupe(u8, resolved_ref.?.provider),
         .model = try allocator.dupe(u8, resolved_ref.?.model),
     };
+    errdefer freeNamedAgentConfig(allocator, &agent_cfg);
     if (item.object.get("system_prompt")) |sp| {
-        if (sp == .string) agent_cfg.system_prompt = try allocator.dupe(u8, sp.string);
+        if (sp == .string) {
+            const val = sp.string;
+            if (std.fs.path.isAbsolute(val) and std.mem.indexOfScalar(u8, val, '\n') == null) {
+                const file_content = blk: {
+                    const file = std.fs.openFileAbsolute(val, .{}) catch |err| {
+                        std.log.warn("system_prompt looks like a file path but failed to open '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                    defer file.close();
+                    break :blk file.readToEndAlloc(allocator, 64 * 1024) catch |err| {
+                        std.log.warn("system_prompt failed to read file '{s}': {s}", .{ val, @errorName(err) });
+                        break :blk null;
+                    };
+                };
+                if (file_content) |content| {
+                    agent_cfg.system_prompt = content;
+                    agent_cfg.system_prompt_path = try allocator.dupe(u8, val);
+                } else {
+                    agent_cfg.system_prompt = try allocator.dupe(u8, val);
+                }
+            } else {
+                agent_cfg.system_prompt = try allocator.dupe(u8, val);
+            }
+        }
     }
     if (item.object.get("api_key")) |ak| {
         if (ak == .string) agent_cfg.api_key = try allocator.dupe(u8, ak.string);
@@ -170,6 +205,26 @@ fn freeModelRouteConfig(allocator: std.mem.Allocator, route: types.ModelRouteCon
     allocator.free(route.provider);
     allocator.free(route.model);
     if (route.api_key) |api_key| allocator.free(api_key);
+}
+
+/// Normalize a peer ID from config: convert legacy `#topic:N` format to
+/// canonical `:thread:N` format used internally for route matching.
+/// Logs a deprecation warning when conversion occurs.
+fn normalizePeerId(allocator: std.mem.Allocator, raw_id: []const u8) ![]u8 {
+    const legacy_sep = "#topic:";
+    if (std.mem.indexOf(u8, raw_id, legacy_sep)) |sep_pos| {
+        const chat_id = raw_id[0..sep_pos];
+        const thread_part = raw_id[sep_pos + legacy_sep.len ..];
+        if (chat_id.len > 0 and thread_part.len > 0) {
+            log.warn(
+                "binding peer id \"{s}\" uses deprecated #topic: format — " ++
+                    "please update config.json to use \":thread:\" instead (e.g. \"{s}:thread:{s}\")",
+                .{ raw_id, chat_id, thread_part },
+            );
+            return std.fmt.allocPrint(allocator, "{s}:thread:{s}", .{ chat_id, thread_part });
+        }
+    }
+    return allocator.dupe(u8, raw_id);
 }
 
 fn parseAgentBindingsArray(
@@ -221,7 +276,7 @@ fn parseAgentBindingsArray(
                             if (parsePeerKind(kind_val.?.string)) |kind| {
                                 binding.match.peer = .{
                                     .kind = kind,
-                                    .id = try allocator.dupe(u8, id_val.?.string),
+                                    .id = try normalizePeerId(allocator, id_val.?.string),
                                 };
                             }
                         }
@@ -259,7 +314,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     if (accounts.get("default")) |default_acc| {
         if (default_acc == .object) {
             if (has_multiple) {
-                std.log.warn("Multiple accounts configured; using accounts.default", .{});
+                log.warn("Multiple accounts configured; using accounts.default", .{});
             }
             return .{ .id = "default", .value = default_acc };
         }
@@ -267,7 +322,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     if (accounts.get("main")) |main_acc| {
         if (main_acc == .object) {
             if (has_multiple) {
-                std.log.warn("Multiple accounts configured; using accounts.main", .{});
+                log.warn("Multiple accounts configured; using accounts.main", .{});
             }
             return .{ .id = "main", .value = main_acc };
         }
@@ -277,7 +332,7 @@ fn getPreferredAccount(channel_obj: std.json.ObjectMap) ?SelectedAccount {
     const first = it.next() orelse return null;
     if (first.value_ptr.* != .object) return null;
     if (has_multiple) {
-        std.log.warn("Multiple accounts configured; only first account used", .{});
+        log.warn("Multiple accounts configured; only first account used", .{});
     }
     return .{
         .id = first.key_ptr.*,
@@ -584,12 +639,17 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (agents_val.object.get("list")) |list_val| {
                 if (list_val == .array) {
                     var list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                    errdefer {
+                        for (list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                        list.deinit(self.allocator);
+                    }
                     try list.ensureTotalCapacity(self.allocator, @intCast(list_val.array.items.len));
                     for (list_val.array.items) |item| {
                         if (item == .object) {
                             const name_val = item.object.get("id") orelse item.object.get("name") orelse continue;
                             if (name_val != .string) continue;
-                            const agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
+                            var agent_cfg = try parseNamedAgentObject(self.allocator, name_val.string, item) orelse continue;
+                            errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                             try list.append(self.allocator, agent_cfg);
                         }
                     }
@@ -601,11 +661,16 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             // "agents": { "defaults": {...}, "coder": {...}, "researcher": {...} }
             if (self.agents.len == 0) {
                 var named_agent_list: std.ArrayListUnmanaged(types.NamedAgentConfig) = .empty;
+                errdefer {
+                    for (named_agent_list.items) |*agent_cfg| freeNamedAgentConfig(self.allocator, agent_cfg);
+                    named_agent_list.deinit(self.allocator);
+                }
                 var it = agents_val.object.iterator();
                 while (it.next()) |entry| {
                     const key = entry.key_ptr.*;
                     if (std.mem.eql(u8, key, "defaults") or std.mem.eql(u8, key, "list")) continue;
-                    const agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    var agent_cfg = try parseNamedAgentObject(self.allocator, key, entry.value_ptr.*) orelse continue;
+                    errdefer freeNamedAgentConfig(self.allocator, &agent_cfg);
                     try named_agent_list.append(self.allocator, agent_cfg);
                 }
                 self.agents = try named_agent_list.toOwnedSlice(self.allocator);
@@ -1586,6 +1651,27 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
         }
     }
 
+    // A2A (Agent-to-Agent protocol)
+    if (root.get("a2a")) |a2a| {
+        if (a2a == .object) {
+            if (a2a.object.get("enabled")) |v| {
+                if (v == .bool) self.a2a.enabled = v.bool;
+            }
+            if (a2a.object.get("name")) |v| {
+                if (v == .string) self.a2a.name = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("description")) |v| {
+                if (v == .string) self.a2a.description = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("url")) |v| {
+                if (v == .string) self.a2a.url = try self.allocator.dupe(u8, v.string);
+            }
+            if (a2a.object.get("version")) |v| {
+                if (v == .string) self.a2a.version = try self.allocator.dupe(u8, v.string);
+            }
+        }
+    }
+
     // Identity
     if (root.get("identity")) |id| {
         if (id == .object) {
@@ -1805,6 +1891,58 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (tun.object.get("provider")) |v| {
                 if (v == .string) self.tunnel.provider = try self.allocator.dupe(u8, v.string);
             }
+            // cloudflare sub-config
+            if (tun.object.get("cloudflare")) |cf| {
+                if (cf == .object) {
+                    var cf_cfg = types.CloudflareTunnelConfig{};
+                    if (cf.object.get("token")) |tok| {
+                        if (tok == .string) cf_cfg.token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    self.tunnel.cloudflare = cf_cfg;
+                }
+            }
+            // ngrok sub-config
+            if (tun.object.get("ngrok")) |ng| {
+                if (ng == .object) {
+                    var ng_cfg = types.NgrokTunnelConfig{};
+                    if (ng.object.get("auth_token")) |tok| {
+                        if (tok == .string) ng_cfg.auth_token = try self.allocator.dupe(u8, tok.string);
+                    }
+                    if (ng.object.get("domain")) |dom| {
+                        if (dom == .string) ng_cfg.domain = try self.allocator.dupe(u8, dom.string);
+                    }
+                    self.tunnel.ngrok = ng_cfg;
+                }
+            }
+            // tailscale sub-config
+            if (tun.object.get("tailscale")) |ts| {
+                if (ts == .object) {
+                    var ts_cfg = types.TailscaleTunnelConfig{};
+                    if (ts.object.get("funnel")) |fnl| {
+                        if (fnl == .bool) ts_cfg.funnel = fnl.bool;
+                    }
+                    if (ts.object.get("hostname")) |hn| {
+                        if (hn == .string) ts_cfg.hostname = try self.allocator.dupe(u8, hn.string);
+                    }
+                    self.tunnel.tailscale = ts_cfg;
+                }
+            }
+            // custom sub-config
+            if (tun.object.get("custom")) |cst| {
+                if (cst == .object) {
+                    var cst_cfg = types.CustomTunnelConfig{};
+                    if (cst.object.get("start_command")) |cmd| {
+                        if (cmd == .string) cst_cfg.start_command = try self.allocator.dupe(u8, cmd.string);
+                    }
+                    if (cst.object.get("health_url")) |hu| {
+                        if (hu == .string) cst_cfg.health_url = try self.allocator.dupe(u8, hu.string);
+                    }
+                    if (cst.object.get("url_pattern")) |up| {
+                        if (up == .string) cst_cfg.url_pattern = try self.allocator.dupe(u8, up.string);
+                    }
+                    self.tunnel.custom = cst_cfg;
+                }
+            }
         }
     }
 
@@ -1920,4 +2058,70 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             }
         }
     }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// Tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "normalizePeerId converts legacy #topic: format to canonical :thread: format" {
+    const allocator = std.testing.allocator;
+
+    // Legacy #topic: format should be converted
+    const converted = try normalizePeerId(allocator, "-1009999999999#topic:4");
+    defer allocator.free(converted);
+    try std.testing.expectEqualStrings("-1009999999999:thread:4", converted);
+
+    // Canonical :thread: format should pass through unchanged
+    const canonical = try normalizePeerId(allocator, "-1009999999999:thread:4");
+    defer allocator.free(canonical);
+    try std.testing.expectEqualStrings("-1009999999999:thread:4", canonical);
+
+    // Plain peer ID without topic should pass through unchanged
+    const plain = try normalizePeerId(allocator, "-1009999999999");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings("-1009999999999", plain);
+
+    // Direct chat ID should pass through unchanged
+    const direct = try normalizePeerId(allocator, "5555555555");
+    defer allocator.free(direct);
+    try std.testing.expectEqualStrings("5555555555", direct);
+}
+
+test "parseAgentBindingsArray normalizes legacy #topic: peer IDs" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\[{
+        \\  "agent_id": "coder",
+        \\  "match": {
+        \\    "channel": "telegram",
+        \\    "account_id": "main",
+        \\    "peer": {
+        \\      "kind": "group",
+        \\      "id": "-1009999999999#topic:4"
+        \\    }
+        \\  }
+        \\}]
+    ;
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+    defer parsed.deinit();
+
+    const bindings = try parseAgentBindingsArray(allocator, parsed.value.array);
+    defer {
+        for (bindings) |b| {
+            allocator.free(b.agent_id);
+            if (b.match.channel) |ch| allocator.free(ch);
+            if (b.match.account_id) |aid| allocator.free(aid);
+            if (b.match.peer) |p| allocator.free(p.id);
+        }
+        allocator.free(bindings);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), bindings.len);
+    try std.testing.expectEqualStrings("coder", bindings[0].agent_id);
+    try std.testing.expect(bindings[0].match.peer != null);
+    // The legacy #topic:4 format must be normalized to :thread:4
+    try std.testing.expectEqualStrings("-1009999999999:thread:4", bindings[0].match.peer.?.id);
 }

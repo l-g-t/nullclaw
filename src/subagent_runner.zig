@@ -132,14 +132,18 @@ pub fn runTaskWithTools(
         "{s}\n\n{s}",
         .{ request.system_prompt, tool_instructions },
     );
-    errdefer allocator.free(full_system);
-
-    try agent.history.append(allocator, .{
+    // After append, ownership transfers to agent.history; agent.deinit() frees it.
+    // Use catch to free only if append itself fails (avoids double-free with deinit).
+    agent.history.append(allocator, .{
         .role = .system,
         .content = full_system,
-    });
+    }) catch |err| {
+        allocator.free(full_system);
+        return err;
+    };
     agent.has_system_prompt = true;
     agent.system_prompt_has_conversation_context = false;
+    agent.system_prompt_conversation_context_fingerprint = null;
     agent.workspace_prompt_fingerprint = agent_mod.prompt.workspacePromptFingerprint(allocator, request.workspace_dir, agent.bootstrap) catch null;
 
     return agent.turn(request.task);

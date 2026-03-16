@@ -9,6 +9,32 @@ const AtomicBool = std.atomic.Value(bool);
 
 const log = std.log.scoped(.http_util);
 threadlocal var thread_interrupt_flag: ?*const AtomicBool = null;
+const DEFAULT_CURL_GET_MAX_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_CURL_POST_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn classifyCurlExitCode(code: u8) []const u8 {
+    return switch (code) {
+        6 => "dns",
+        7 => "connect",
+        28 => "timeout",
+        35, 51, 58, 60 => "tls",
+        else => "other",
+    };
+}
+
+fn mapCurlExitCodeToError(code: u8) anyerror {
+    return switch (code) {
+        6 => error.CurlDnsError,
+        7 => error.CurlConnectError,
+        28 => error.CurlTimeout,
+        35, 51, 58, 60 => error.CurlTlsError,
+        else => error.CurlFailed,
+    };
+}
+
+fn logCurlExitFailure(op: []const u8, code: u8) void {
+    log.warn("curl {s} failed: exit_code={d} class={s}", .{ op, code, classifyCurlExitCode(code) });
+}
 
 pub fn setThreadInterruptFlag(flag: ?*const AtomicBool) void {
     thread_interrupt_flag = flag;
@@ -182,7 +208,7 @@ fn curlRequestWithProxy(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -195,9 +221,9 @@ fn curlRequestWithProxy(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            log.debug("curl {s} exited with code {d}", .{ method, code });
+            logCurlExitFailure(method, code);
             allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
         else => {
             allocator.free(stdout);
@@ -299,7 +325,7 @@ pub fn curlPostWithStatus(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWriteError;
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, DEFAULT_CURL_POST_MAX_BYTES) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -311,7 +337,10 @@ pub fn curlPostWithStatus(
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlWaitError;
     };
     switch (term) {
-        .Exited => |code| if (code != 0) return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
+        .Exited => |code| if (code != 0) {
+            logCurlExitFailure("POST", code);
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
+        },
         else => return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed,
     }
 
@@ -354,6 +383,7 @@ fn curlGetWithProxyAndResolve(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
     resolve_entry: ?[]const u8,
+    max_bytes: usize,
 ) ![]u8 {
     var argv_buf: [48][]const u8 = undefined;
     var argc: usize = 0;
@@ -410,7 +440,7 @@ fn curlGetWithProxyAndResolve(
         if (cancel_watcher) |t| t.join();
     }
 
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 4 * 1024 * 1024) catch {
+    const stdout = child.stdout.?.readToEndAlloc(allocator, max_bytes) catch {
         _ = child.kill() catch {};
         _ = child.wait() catch {};
         return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlReadError;
@@ -422,9 +452,9 @@ fn curlGetWithProxyAndResolve(
     };
     switch (term) {
         .Exited => |code| if (code != 0) {
-            log.debug("curl GET exited with code {d} (timeout={s}s)", .{ code, timeout_secs });
+            logCurlExitFailure("GET", code);
             allocator.free(stdout);
-            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
+            return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
         },
         else => {
             allocator.free(stdout);
@@ -446,7 +476,7 @@ pub fn curlGetWithProxy(
     timeout_secs: []const u8,
     proxy: ?[]const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null);
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, proxy, null, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
 /// HTTP GET via curl subprocess with a pinned host mapping.
@@ -459,12 +489,23 @@ pub fn curlGetWithResolve(
     timeout_secs: []const u8,
     resolve_entry: []const u8,
 ) ![]u8 {
-    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry);
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, resolve_entry, DEFAULT_CURL_GET_MAX_BYTES);
 }
 
 /// HTTP GET via curl subprocess (no proxy).
 pub fn curlGet(allocator: Allocator, url: []const u8, headers: []const []const u8, timeout_secs: []const u8) ![]u8 {
     return curlGetWithProxy(allocator, url, headers, timeout_secs, null);
+}
+
+/// HTTP GET via curl subprocess with a caller-provided response size cap.
+pub fn curlGetMaxBytes(
+    allocator: Allocator,
+    url: []const u8,
+    headers: []const []const u8,
+    timeout_secs: []const u8,
+    max_bytes: usize,
+) ![]u8 {
+    return curlGetWithProxyAndResolve(allocator, url, headers, timeout_secs, null, null, max_bytes);
 }
 
 /// Read proxy URL from standard environment variables.
@@ -590,9 +631,9 @@ pub fn curlGetSSE(
                 // but curl may have received some data before timing out - return it.
                 // For other exit codes, treat as error.
                 if (code != 28) {
-                    std.debug.print("[curlGetSSE] curl error: code={}\n", .{code});
+                    logCurlExitFailure("GET-SSE", code);
                     allocator.free(stdout);
-                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else error.CurlFailed;
+                    return if (cancel_flag != null and cancel_flag.?.load(.acquire)) error.CurlInterrupted else mapCurlExitCodeToError(code);
                 }
                 // Timeout (code 28) - return any data we received
             }
@@ -643,6 +684,30 @@ test "curlGet with zero headers compiles and is callable" {
 
 test "curlGetWithResolve compiles and is callable" {
     try std.testing.expect(true);
+}
+
+test "curlGetMaxBytes compiles and is callable" {
+    _ = curlGetMaxBytes;
+}
+
+test "curl post max bytes is increased for large provider responses" {
+    try std.testing.expect(DEFAULT_CURL_POST_MAX_BYTES >= 8 * 1024 * 1024);
+}
+
+test "curl exit code classification maps key network classes" {
+    try std.testing.expectEqualStrings("dns", classifyCurlExitCode(6));
+    try std.testing.expectEqualStrings("connect", classifyCurlExitCode(7));
+    try std.testing.expectEqualStrings("timeout", classifyCurlExitCode(28));
+    try std.testing.expectEqualStrings("tls", classifyCurlExitCode(60));
+    try std.testing.expectEqualStrings("other", classifyCurlExitCode(22));
+}
+
+test "curl exit code mapping returns specific errors" {
+    try std.testing.expect(mapCurlExitCodeToError(6) == error.CurlDnsError);
+    try std.testing.expect(mapCurlExitCodeToError(7) == error.CurlConnectError);
+    try std.testing.expect(mapCurlExitCodeToError(28) == error.CurlTimeout);
+    try std.testing.expect(mapCurlExitCodeToError(60) == error.CurlTlsError);
+    try std.testing.expect(mapCurlExitCodeToError(22) == error.CurlFailed);
 }
 
 test "normalizeProxyEnvValue trims surrounding whitespace" {
