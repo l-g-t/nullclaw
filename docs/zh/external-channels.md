@@ -509,6 +509,7 @@ nullclaw channel start whatsapp_web
 仓库里提供了一个 bridge 适配器示例：
 
 - [`examples/whatsapp-web/nullclaw-plugin-whatsapp-web`](../../examples/whatsapp-web/nullclaw-plugin-whatsapp-web)
+- [`examples/external-channel-template/nullclaw-plugin-template`](../../examples/external-channel-template/nullclaw-plugin-template)
 
 它把 PR #265 里的 WhatsApp Web HTTP bridge 形态转换成当前 ExternalChannel JSON-RPC 协议。
 
@@ -516,6 +517,11 @@ nullclaw channel start whatsapp_web
 WhatsApp 登录的职责边界、QR/pairing 归属以及首次联调步骤，请继续看：
 
 - [`examples/whatsapp-web/README.md`](../../examples/whatsapp-web/README.md)
+
+如果你需要的是一个不绑定任何具体渠道的起步模板，而不是 WhatsApp
+专用 bridge 示例，请看：
+
+- [`examples/external-channel-template/README.md`](../../examples/external-channel-template/README.md)
 
 ## 插件作者检查单
 

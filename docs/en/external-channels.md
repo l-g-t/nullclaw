@@ -519,6 +519,7 @@ Starts the configured external account with runtime name `whatsapp_web`.
 The repository includes a bridge adapter at:
 
 - [`examples/whatsapp-web/nullclaw-plugin-whatsapp-web`](../../examples/whatsapp-web/nullclaw-plugin-whatsapp-web)
+- [`examples/external-channel-template/nullclaw-plugin-template`](../../examples/external-channel-template/nullclaw-plugin-template)
 
 It converts the WhatsApp Web HTTP bridge shape from PR #265 into the current
 ExternalChannel JSON-RPC contract.
@@ -527,6 +528,11 @@ For the full WhatsApp Web operator journey, including bridge auth vs WhatsApp
 auth, QR/pairing ownership, and first-run validation, see the example README:
 
 - [`examples/whatsapp-web/README.md`](../../examples/whatsapp-web/README.md)
+
+If you want a generic authoring starting point rather than a WhatsApp-specific
+bridge, use:
+
+- [`examples/external-channel-template/README.md`](../../examples/external-channel-template/README.md)
 
 ## Plugin Author Checklist
 
