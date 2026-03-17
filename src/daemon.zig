@@ -588,11 +588,12 @@ fn buildInboundConversationContext(
 
     const has_sender_identity = meta.sender_username != null or meta.sender_display_name != null;
     const has_scope = inferred_is_group != null or group_id != null or meta.peer_id != null or meta.guild_id != null or meta.channel_id != null;
-    if (!has_sender_identity and !has_scope) return null;
+    const has_channel = msg.channel.len > 0;
+    if (!has_channel and !has_sender_identity and !has_scope) return null;
 
     return .{
-        .channel = msg.channel,
-        .sender_id = msg.sender_id,
+        .channel = if (has_channel) msg.channel else null,
+        .sender_id = if (has_sender_identity or has_scope) msg.sender_id else null,
         .sender_username = meta.sender_username,
         .sender_display_name = meta.sender_display_name,
         .group_id = group_id,
@@ -2063,13 +2064,29 @@ test "buildInboundConversationContext preserves discord identity metadata" {
     try std.testing.expect(context.is_group.?);
 }
 
+test "buildInboundConversationContext keeps channel when metadata is absent" {
+    const msg = bus_mod.InboundMessage{
+        .channel = "external",
+        .sender_id = "user-1",
+        .chat_id = "chat-1",
+        .content = "hello",
+        .session_key = "external:chat-1",
+    };
+    const context = buildInboundConversationContext(&msg, .{}) orelse return error.TestUnexpectedResult;
+
+    try std.testing.expectEqualStrings("external", context.channel.?);
+    try std.testing.expect(context.sender_id == null);
+    try std.testing.expect(context.group_id == null);
+    try std.testing.expect(context.is_group == null);
+}
+
 test "buildInboundConversationContext uses standardized peer metadata for external channels" {
     const msg = bus_mod.InboundMessage{
-        .channel = "whatsapp_web",
-        .sender_id = "5511",
+        .channel = "external",
+        .sender_id = "user-42",
         .chat_id = "120363-room",
         .content = "hello",
-        .session_key = "whatsapp_web:room",
+        .session_key = "external:room",
     };
     const context = buildInboundConversationContext(&msg, .{
         .peer_kind = .group,
@@ -2077,8 +2094,8 @@ test "buildInboundConversationContext uses standardized peer metadata for extern
         .is_group = true,
     }) orelse return error.TestUnexpectedResult;
 
-    try std.testing.expectEqualStrings("whatsapp_web", context.channel.?);
-    try std.testing.expectEqualStrings("5511", context.sender_id.?);
+    try std.testing.expectEqualStrings("external", context.channel.?);
+    try std.testing.expectEqualStrings("user-42", context.sender_id.?);
     try std.testing.expectEqualStrings("120363-room", context.group_id.?);
     try std.testing.expect(context.is_group.?);
 }

@@ -1205,11 +1205,6 @@ pub const TelegramChannel = struct {
         invalid_option,
     };
 
-    const ParsedCallbackData = struct {
-        token: []const u8,
-        option_id: []const u8,
-    };
-
     fn nextInteractionToken(self: *TelegramChannel) ![]u8 {
         const seq = self.interaction_seq.fetchAdd(1, .monotonic) + 1;
         var buf: [32]u8 = undefined;
@@ -1229,9 +1224,8 @@ pub const TelegramChannel = struct {
         for (directive.options, 0..) |opt, i| {
             if (i > 0) try out.appendSlice(self.allocator, ",");
 
-            var callback_data_buf: [128]u8 = undefined;
-            const callback_data = try std.fmt.bufPrint(&callback_data_buf, "nc1:{s}:{s}", .{ token, opt.id });
-            if (callback_data.len > 64) return error.CallbackDataTooLong;
+            var callback_data_buf: [64]u8 = undefined;
+            const callback_data = try interaction_choices.formatChoiceCallbackData(&callback_data_buf, token, opt.id, 64);
 
             try out.appendSlice(self.allocator, "[{\"text\":");
             try root.json_util.appendJsonString(&out, self.allocator, opt.label);
@@ -1332,22 +1326,6 @@ pub const TelegramChannel = struct {
                 self.allocator.free(kv.key);
             }
         }
-    }
-
-    fn parseCallbackData(data: []const u8) ?ParsedCallbackData {
-        if (!std.mem.startsWith(u8, data, "nc1:")) return null;
-        const rest = data["nc1:".len..];
-        const sep = std.mem.indexOfScalar(u8, rest, ':') orelse return null;
-        if (sep == 0 or sep + 1 >= rest.len) return null;
-        const token = rest[0..sep];
-        const option_id = rest[sep + 1 ..];
-        if (token.len == 0) return null;
-        if (option_id.len == 0 or option_id.len > interaction_choices.MAX_ID_LEN) return null;
-        for (option_id) |c| {
-            const ok = (c >= 'a' and c <= 'z') or (c >= '0' and c <= '9') or c == '_' or c == '-';
-            if (!ok) return null;
-        }
-        return .{ .token = token, .option_id = option_id };
     }
 
     fn consumeCallbackSelection(
@@ -2574,7 +2552,7 @@ pub const TelegramChannel = struct {
 
         const cb_data_val = callback_query.object.get("data") orelse return;
         const cb_data = if (cb_data_val == .string) cb_data_val.string else return;
-        const parsed_cb = parseCallbackData(cb_data) orelse {
+        const parsed_cb = interaction_choices.parseChoiceCallbackData(cb_data) orelse {
             self.answerCallbackQuery(cb_id, "Unsupported button");
             return;
         };
@@ -4752,18 +4730,6 @@ test "telegram buildGetUpdatesBody includes callback_query" {
     const body = try TelegramChannel.buildGetUpdatesBody(&buf, 10, 30);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"callback_query\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"message\"") != null);
-}
-
-test "telegram parseCallbackData parses valid format" {
-    const parsed = TelegramChannel.parseCallbackData("nc1:abc123:yes") orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqualStrings("abc123", parsed.token);
-    try std.testing.expectEqualStrings("yes", parsed.option_id);
-}
-
-test "telegram parseCallbackData rejects malformed format" {
-    try std.testing.expect(TelegramChannel.parseCallbackData("nc1:abc123") == null);
-    try std.testing.expect(TelegramChannel.parseCallbackData("bad:abc123:yes") == null);
-    try std.testing.expect(TelegramChannel.parseCallbackData("nc1:abc123:Yes") == null);
 }
 
 test "telegram isAuthorizedIdentity enforces group allowlist and ids" {
