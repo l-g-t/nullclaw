@@ -205,6 +205,28 @@ pub const AgentConfig = struct {
     /// When true, automatically adds the current model to vision_disabled_models
     /// upon receiving a "model does not support vision" error.
     auto_disable_vision_on_error: bool = true,
+
+    pub fn parseTimezoneOffsetSeconds(raw: []const u8) ?i64 {
+        if (std.ascii.eqlIgnoreCase(raw, "UTC")) return 0;
+        if (raw.len != 9) return null;
+        if (!std.ascii.eqlIgnoreCase(raw[0..3], "UTC")) return null;
+
+        const sign = raw[3];
+        if (sign != '+' and sign != '-') return null;
+        if (raw[6] != ':') return null;
+
+        const hours = std.fmt.parseInt(i64, raw[4..6], 10) catch return null;
+        const minutes = std.fmt.parseInt(i64, raw[7..9], 10) catch return null;
+        if (hours < 0 or hours > 23) return null;
+        if (minutes < 0 or minutes > 59) return null;
+
+        const total = hours * 3600 + minutes * 60;
+        return if (sign == '-') -total else total;
+    }
+
+    pub fn isValidTimezone(raw: []const u8) bool {
+        return parseTimezoneOffsetSeconds(raw) != null;
+    }
 };
 
 pub const ToolsConfig = struct {
@@ -1523,6 +1545,17 @@ test "WebConfig normalizePath trims and normalizes" {
     try std.testing.expectEqualStrings("/relay", WebConfig.normalizePath(" /relay/ "));
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath("relay"));
     try std.testing.expectEqualStrings(WebConfig.DEFAULT_PATH, WebConfig.normalizePath(""));
+}
+
+test "AgentConfig timezone validation accepts UTC and fixed offsets" {
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC"));
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC+05:30"));
+    try std.testing.expect(AgentConfig.isValidTimezone("UTC-03:00"));
+    try std.testing.expect(AgentConfig.isValidTimezone("utc+08:00"));
+
+    try std.testing.expect(!AgentConfig.isValidTimezone("Asia/Shanghai"));
+    try std.testing.expect(!AgentConfig.isValidTimezone("UTC+25:00"));
+    try std.testing.expect(!AgentConfig.isValidTimezone("UTC+08"));
 }
 
 test "WebConfig token validation enforces printable no-whitespace constraints" {

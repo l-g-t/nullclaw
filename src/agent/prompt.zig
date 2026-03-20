@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
 const platform = @import("../platform.zig");
 const memory_root = @import("../memory/root.zig");
@@ -686,34 +687,17 @@ fn appendSkillsSection(
     }
 }
 
-fn parseUtcOffsetSeconds(timezone: []const u8) ?i64 {
-    if (std.ascii.eqlIgnoreCase(timezone, "UTC")) return 0;
-    if (timezone.len != 9) return null;
-    if (!std.ascii.eqlIgnoreCase(timezone[0..3], "UTC")) return null;
-
-    const sign = timezone[3];
-    if (sign != '+' and sign != '-') return null;
-    if (timezone[6] != ':') return null;
-
-    const hours = std.fmt.parseInt(i64, timezone[4..6], 10) catch return null;
-    const minutes = std.fmt.parseInt(i64, timezone[7..9], 10) catch return null;
-    if (hours < 0 or hours > 23) return null;
-    if (minutes < 0 or minutes > 59) return null;
-
-    const total = hours * 3600 + minutes * 60;
-    return if (sign == '-') -total else total;
-}
-
 /// Append a human-readable date/time section using configured timezone.
 /// Supported timezone values:
 /// - "UTC" (default)
 /// - fixed offsets in format "UTC+HH:MM" or "UTC-HH:MM"
 fn appendDateTimeSection(w: anytype, timezone: []const u8) !void {
-    const offset_secs = parseUtcOffsetSeconds(timezone) orelse 0;
+    const offset_secs_opt = config_types.AgentConfig.parseTimezoneOffsetSeconds(timezone);
+    const offset_secs = offset_secs_opt orelse 0;
     const adjusted_ts: i64 = std.time.timestamp() + offset_secs;
     const safe_ts: u64 = if (adjusted_ts < 0) 0 else @intCast(adjusted_ts);
 
-    const tz_label = if (parseUtcOffsetSeconds(timezone) != null) timezone else "UTC";
+    const tz_label = if (offset_secs_opt != null) timezone else "UTC";
     const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = safe_ts };
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
@@ -1763,11 +1747,11 @@ test "appendDateTimeSection supports fixed UTC offset" {
 }
 
 test "parseUtcOffsetSeconds validates supported formats" {
-    try std.testing.expectEqual(@as(?i64, 0), parseUtcOffsetSeconds("UTC"));
-    try std.testing.expectEqual(@as(?i64, 5 * 3600 + 30 * 60), parseUtcOffsetSeconds("UTC+05:30"));
-    try std.testing.expectEqual(@as(?i64, -(3 * 3600)), parseUtcOffsetSeconds("UTC-03:00"));
-    try std.testing.expect(parseUtcOffsetSeconds("Asia/Shanghai") == null);
-    try std.testing.expect(parseUtcOffsetSeconds("UTC+25:00") == null);
+    try std.testing.expectEqual(@as(?i64, 0), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC"));
+    try std.testing.expectEqual(@as(?i64, 5 * 3600 + 30 * 60), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC+05:30"));
+    try std.testing.expectEqual(@as(?i64, -(3 * 3600)), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC-03:00"));
+    try std.testing.expect(config_types.AgentConfig.parseTimezoneOffsetSeconds("Asia/Shanghai") == null);
+    try std.testing.expect(config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC+25:00") == null);
 }
 test "appendSkillsSection with no skills produces nothing" {
     const allocator = std.testing.allocator;

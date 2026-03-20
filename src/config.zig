@@ -785,6 +785,7 @@ pub const Config = struct {
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
+            .timezone = self.agent.timezone,
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
         }, .{})});
@@ -886,6 +887,7 @@ pub const Config = struct {
         InvalidDefaultModelPrimary,
         NoDefaultModel,
         TemperatureOutOfRange,
+        InvalidAgentTimezone,
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
@@ -924,6 +926,9 @@ pub const Config = struct {
         }
         if (self.default_temperature < 0.0 or self.default_temperature > 2.0) {
             return ValidationError.TemperatureOutOfRange;
+        }
+        if (!config_types.AgentConfig.isValidTimezone(self.agent.timezone)) {
+            return ValidationError.InvalidAgentTimezone;
         }
         if (self.gateway.port == 0) {
             return ValidationError.InvalidPort;
@@ -1031,6 +1036,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
+            ValidationError.InvalidAgentTimezone => std.debug.print("Config error: agent.timezone must be 'UTC' or a fixed offset like 'UTC+08:00'.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
@@ -1152,6 +1158,17 @@ test "validation rejects bad temperature" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expectError(Config.ValidationError.TemperatureOutOfRange, cfg.validate());
+}
+
+test "validation rejects invalid agent timezone" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .agent = .{ .timezone = "Asia/Shanghai" },
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidAgentTimezone, cfg.validate());
 }
 
 test "json parse reads reliability fallback providers and model fallbacks" {
@@ -1667,6 +1684,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.compaction_max_source_chars = 9000;
     cfg.agent.status_show_emojis = false;
     cfg.agent.message_timeout_secs = 60;
+    cfg.agent.timezone = "UTC+08:00";
 
     cfg.memory.search.provider = "openai";
     cfg.memory.search.model = "text-embedding-3-small";
@@ -1788,6 +1806,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
+    try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
