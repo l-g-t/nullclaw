@@ -45,6 +45,8 @@ const CompatProvider = struct {
     merge_system_into_user: bool = false,
     /// Authentication style (default: Bearer token).
     auth_style: compatible.AuthStyle = .bearer,
+    /// Custom auth header name when auth_style is .custom.
+    custom_header: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
     native_tools: bool = true,
     /// When set, cap max_tokens in non-streaming requests to this value.
@@ -109,6 +111,7 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "doubao", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
     .{ .name = "volcengine", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
     .{ .name = "ark", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
+    .{ .name = "xiaomi", .url = "https://api.xiaomimimo.com/v1", .display = "Xiaomi MiMo", .auth_style = .custom, .custom_header = "api-key" },
     .{ .name = "hunyuan", .url = "https://api.hunyuan.cloud.tencent.com/v1", .display = "Hunyuan" },
     .{ .name = "tencent", .url = "https://api.hunyuan.cloud.tencent.com/v1", .display = "Hunyuan" },
     .{ .name = "baichuan", .url = "https://api.baichuan-ai.com/v1", .display = "Baichuan" },
@@ -191,6 +194,12 @@ comptime {
 fn findCompatProvider(name: []const u8) ?CompatProvider {
     for (&compat_providers) |*p| {
         if (std.mem.eql(u8, p.name, name)) return p.*;
+    }
+    const canonical = provider_names.canonicalProviderName(name);
+    if (!std.mem.eql(u8, canonical, name)) {
+        for (&compat_providers) |*p| {
+            if (std.mem.eql(u8, p.name, canonical)) return p.*;
+        }
     }
     return null;
 }
@@ -396,6 +405,7 @@ pub const ProviderHolder = union(enum) {
                 if (cp) |c| {
                     if (c.no_responses_fallback) prov.supports_responses_fallback = false;
                     if (c.merge_system_into_user) prov.merge_system_into_user = true;
+                    if (c.custom_header) |header| prov.custom_header = header;
                     if (!c.native_tools) prov.native_tools = false;
                     if (c.max_tokens_non_streaming) |cap| prov.max_tokens_non_streaming = cap;
                     if (c.thinking_param) prov.thinking_param = true;
@@ -496,6 +506,9 @@ test "classifyProvider new providers" {
     try std.testing.expect(classifyProvider("glm-cn") == .compatible_provider);
     try std.testing.expect(classifyProvider("bigmodel") == .compatible_provider);
     try std.testing.expect(classifyProvider("qwen-portal") == .compatible_provider);
+    try std.testing.expect(classifyProvider("xiaomi") == .compatible_provider);
+    try std.testing.expect(classifyProvider("xiaomi-mimo") == .compatible_provider);
+    try std.testing.expect(classifyProvider("mimo") == .compatible_provider);
 }
 
 test "compatibleProviderUrl returns correct URLs" {
@@ -537,6 +550,9 @@ test "compatibleProviderUrl new providers" {
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
     try std.testing.expectEqualStrings("https://portal.qwen.ai/v1", compatibleProviderUrl("qwen-portal").?);
     try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", compatibleProviderUrl("telnyx").?);
+    try std.testing.expectEqualStrings("https://api.xiaomimimo.com/v1", compatibleProviderUrl("xiaomi").?);
+    try std.testing.expectEqualStrings("https://api.xiaomimimo.com/v1", compatibleProviderUrl("xiaomi-mimo").?);
+    try std.testing.expectEqualStrings("https://api.xiaomimimo.com/v1", compatibleProviderUrl("mimo").?);
 }
 
 test "normalizeAzureBaseUrlOwned appends openai v1 path" {
@@ -608,6 +624,9 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("Baichuan", compatibleProviderDisplayName("baichuan"));
     try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita"));
     try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita-ai"));
+    try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi"));
+    try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("xiaomi-mimo"));
+    try std.testing.expectEqualStrings("Xiaomi MiMo", compatibleProviderDisplayName("mimo"));
     try std.testing.expectEqualStrings("Custom", compatibleProviderDisplayName("nonexistent"));
     try std.testing.expectEqualStrings("Telnyx", compatibleProviderDisplayName("telnyx"));
 }
@@ -625,6 +644,9 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("baichuan") == .compatible_provider);
     try std.testing.expect(classifyProvider("novita") == .compatible_provider);
     try std.testing.expect(classifyProvider("novita-ai") == .compatible_provider);
+    try std.testing.expect(classifyProvider("xiaomi") == .compatible_provider);
+    try std.testing.expect(classifyProvider("xiaomi-mimo") == .compatible_provider);
+    try std.testing.expect(classifyProvider("mimo") == .compatible_provider);
 }
 
 test "findCompatProvider returns correct flags" {
@@ -681,6 +703,14 @@ test "findCompatProvider returns correct flags" {
     // Fireworks has non-streaming max_tokens cap.
     const fireworks = findCompatProvider("fireworks").?;
     try std.testing.expectEqual(@as(?u32, 4096), fireworks.max_tokens_non_streaming);
+
+    // Xiaomi MiMo uses api-key instead of bearer auth.
+    const xiaomi = findCompatProvider("xiaomi").?;
+    try std.testing.expect(xiaomi.auth_style == .custom);
+    try std.testing.expectEqualStrings("api-key", xiaomi.custom_header.?);
+    const xiaomi_alias = findCompatProvider("mimo").?;
+    try std.testing.expect(xiaomi_alias.auth_style == .custom);
+    try std.testing.expectEqualStrings("api-key", xiaomi_alias.custom_header.?);
 }
 
 test "fromConfig keeps native_tools enabled for z.ai/glm aliases" {
@@ -959,6 +989,19 @@ test "ProviderHolder.fromConfig routes to correct variant" {
     defer h6b.deinit();
     try std.testing.expect(h6b == .compatible);
     try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", h6b.compatible.base_url);
+    // compatible (xiaomi from built-in table URL and custom auth header)
+    var h6c = ProviderHolder.fromConfig(alloc, "xiaomi", "test-key", null, true, null, null);
+    defer h6c.deinit();
+    try std.testing.expect(h6c == .compatible);
+    try std.testing.expectEqualStrings("https://api.xiaomimimo.com/v1", h6c.compatible.base_url);
+    try std.testing.expect(h6c.compatible.auth_style == .custom);
+    try std.testing.expectEqualStrings("api-key", h6c.compatible.custom_header.?);
+    var h6d = ProviderHolder.fromConfig(alloc, "mimo", "test-key", null, true, null, null);
+    defer h6d.deinit();
+    try std.testing.expect(h6d == .compatible);
+    try std.testing.expectEqualStrings("https://api.xiaomimimo.com/v1", h6d.compatible.base_url);
+    try std.testing.expect(h6d.compatible.auth_style == .custom);
+    try std.testing.expectEqualStrings("api-key", h6d.compatible.custom_header.?);
     // openai-codex
     var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true, null, null);
     defer h7.deinit();

@@ -106,6 +106,7 @@ pub const known_providers = [_]ProviderInfo{
     // --- Tier 4: AI platform specialists ---
     .{ .key = "venice", .label = "Venice", .default_model = "llama-4-70b-instruct", .env_var = "VENICE_API_KEY" },
     .{ .key = "moonshot", .label = "Moonshot (Kimi)", .default_model = "kimi-k2.5", .env_var = "MOONSHOT_API_KEY" },
+    .{ .key = "xiaomi", .label = "Xiaomi MiMo", .default_model = "mimo-v2-pro", .env_var = "MIMO_API_KEY" },
     .{ .key = "synthetic", .label = "Synthetic", .default_model = "synthetic-model", .env_var = "SYNTHETIC_API_KEY" },
     .{ .key = "opencode-zen", .label = "OpenCode Zen", .default_model = "opencode-model", .env_var = "OPENCODE_API_KEY" },
     .{ .key = "minimax", .label = "MiniMax", .default_model = "minimax-m2.1", .env_var = "MINIMAX_API_KEY" },
@@ -3021,6 +3022,8 @@ test "canonicalProviderName handles aliases" {
     try std.testing.expectEqualStrings("claude-cli", canonicalProviderName("claude-code"));
     try std.testing.expectEqualStrings("azure", canonicalProviderName("azure-openai"));
     try std.testing.expectEqualStrings("azure", canonicalProviderName("azure_openai"));
+    try std.testing.expectEqualStrings("xiaomi", canonicalProviderName("xiaomi-mimo"));
+    try std.testing.expectEqualStrings("xiaomi", canonicalProviderName("mimo"));
     try std.testing.expectEqualStrings("openai", canonicalProviderName("openai"));
 }
 
@@ -3029,6 +3032,8 @@ test "defaultModelForProvider returns known models" {
     try std.testing.expectEqualStrings("gpt-5.2", defaultModelForProvider("openai"));
     try std.testing.expectEqualStrings("gpt-5.2-chat", defaultModelForProvider("azure"));
     try std.testing.expectEqualStrings("deepseek-chat", defaultModelForProvider("deepseek"));
+    try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("xiaomi"));
+    try std.testing.expectEqualStrings("mimo-v2-pro", defaultModelForProvider("mimo"));
     try std.testing.expectEqualStrings("llama4", defaultModelForProvider("ollama"));
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("codex-cli"));
     try std.testing.expectEqualStrings(codex_support.DEFAULT_CODEX_MODEL, defaultModelForProvider("openai-codex"));
@@ -3043,11 +3048,17 @@ test "providerEnvVar known providers" {
     try std.testing.expectEqualStrings("ANTHROPIC_API_KEY", providerEnvVar("anthropic"));
     try std.testing.expectEqualStrings("OPENAI_API_KEY", providerEnvVar("openai"));
     try std.testing.expectEqualStrings("AZURE_OPENAI_API_KEY", providerEnvVar("azure"));
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi"));
     try std.testing.expectEqualStrings("API_KEY", providerEnvVar("ollama"));
 }
 
 test "providerEnvVar grok alias maps to xai" {
     try std.testing.expectEqualStrings("XAI_API_KEY", providerEnvVar("grok"));
+}
+
+test "providerEnvVar xiaomi aliases" {
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("xiaomi-mimo"));
+    try std.testing.expectEqualStrings("MIMO_API_KEY", providerEnvVar("mimo"));
 }
 
 test "providerEnvVar unknown falls back" {
