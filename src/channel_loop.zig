@@ -27,6 +27,7 @@ const provider_runtime = @import("providers/runtime_bundle.zig");
 const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
+const fs_compat = @import("fs_compat.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -929,7 +930,7 @@ pub fn saveTelegramUpdateOffset(
     if (std.fs.path.dirname(path)) |dir| {
         std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
-            else => try std.fs.cwd().makePath(dir),
+            else => try fs_compat.makePath(dir),
         };
     }
 
@@ -2437,7 +2438,7 @@ test "telegram update offset store treats legacy payload without bot_id as stale
     const offset_dir = std.fs.path.dirname(offset_path).?;
     std.fs.makeDirAbsolute(offset_dir) catch |err| switch (err) {
         error.PathAlreadyExists => {},
-        else => try std.fs.cwd().makePath(offset_dir),
+        else => try fs_compat.makePath(offset_dir),
     };
     const file = try std.fs.createFileAbsolute(offset_path, .{});
     defer file.close();

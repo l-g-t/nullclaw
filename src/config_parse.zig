@@ -1213,6 +1213,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
             if (ag.object.get("message_timeout_secs")) |v| {
                 if (v == .integer) self.agent.message_timeout_secs = @intCast(v.integer);
             }
+            if (ag.object.get("timezone")) |v| {
+                if (v == .string) self.agent.timezone = try self.allocator.dupe(u8, v.string);
+            }
             if (ag.object.get("vision_disabled_models")) |v| {
                 if (v == .array) self.agent.vision_disabled_models = try parseStringArray(self.allocator, v.array);
             }
@@ -2197,6 +2200,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (val.object.get("user_agent")) |ua| {
                             if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
+                        }
+                        if (val.object.get("max_streaming_prompt_bytes")) |mb| {
+                            if (mb == .integer and mb.integer >= 0) pe.max_streaming_prompt_bytes = @intCast(mb.integer);
                         }
                         try prov_list.append(self.allocator, pe);
                     }

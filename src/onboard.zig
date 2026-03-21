@@ -23,6 +23,7 @@ const http_util = @import("http_util.zig");
 const json_util = @import("json_util.zig");
 const util = @import("util.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
+const gemini_cli_mod = @import("providers/gemini_cli.zig");
 
 // ── Constants ────────────────────────────────────────────────────
 
@@ -114,6 +115,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "perplexity", .label = "Perplexity", .default_model = "llama-4-sonar-small-128k-online", .env_var = "PERPLEXITY_API_KEY" },
 
     // --- Tier 6: Infrastructure providers ---
+    .{ .key = "novita", .label = "Novita AI (inference)", .default_model = "moonshotai/kimi-k2.5", .env_var = "NOVITA_API_KEY" },
     .{ .key = "nvidia", .label = "NVIDIA NIM (enterprise)", .default_model = "meta/llama-4-70b-instruct", .env_var = "NVIDIA_API_KEY" },
     .{ .key = "cloudflare", .label = "Cloudflare AI Gateway", .default_model = "meta/llama-4-70b-instruct", .env_var = "CLOUDFLARE_API_TOKEN" },
     .{ .key = "vercel-ai", .label = "Vercel AI Gateway", .default_model = "gpt-5.2", .env_var = "VERCEL_API_KEY" },
@@ -135,6 +137,7 @@ pub const known_providers = [_]ProviderInfo{
     .{ .key = "claude-cli", .label = "Claude CLI (claude code, local)", .default_model = "claude-opus-4-6", .env_var = "ANTHROPIC_API_KEY" },
     .{ .key = "codex-cli", .label = "Codex CLI (local CLI)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "OPENAI_API_KEY" },
     .{ .key = "openai-codex", .label = "OpenAI Codex (ChatGPT login)", .default_model = codex_support.DEFAULT_CODEX_MODEL, .env_var = "" },
+    .{ .key = "gemini-cli", .label = "Gemini CLI (Google Gemini, local)", .default_model = "gemini-2.0-flash", .env_var = "GEMINI_API_KEY" },
 };
 
 /// Canonicalize provider name (handle aliases).
@@ -189,6 +192,7 @@ fn providerRequiresApiKeyForSetup(provider: []const u8, base_url: ?[]const u8) b
         std.mem.eql(u8, canonical, "lmstudio") or
         std.mem.eql(u8, canonical, "claude-cli") or
         std.mem.eql(u8, canonical, "codex-cli") or
+        std.mem.eql(u8, canonical, "gemini-cli") or
         std.mem.eql(u8, canonical, "openai-codex"))
     {
         return false;
@@ -234,6 +238,15 @@ fn printProviderNextSteps(
 
     if (std.mem.eql(u8, canonical, "codex-cli")) {
         try out.writeAll("    1. Authenticate:  codex login\n");
+        try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
+        try out.writeAll("       Then type:         Hello!\n");
+        try out.writeAll("    3. Gateway:       nullclaw gateway\n");
+        return;
+    }
+
+    if (std.mem.eql(u8, canonical, "gemini-cli")) {
+        try out.writeAll("    1. Authenticate:  gemini\n");
+        try out.writeAll("       Then choose:   Login with Google\n");
         try out.writeAll("    2. Interactive chat:  nullclaw agent\n");
         try out.writeAll("       Then type:         Hello!\n");
         try out.writeAll("    3. Gateway:       nullclaw gateway\n");
@@ -317,6 +330,12 @@ pub const ModelsCacheEntry = struct {
     fetched_at: i64,
 };
 
+const gemini_cli_fallback = [_][]const u8{
+    "gemini-2.5-pro",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+};
+
 /// Hardcoded fallback models for each provider (used when API fetch fails).
 pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     const canonical = canonicalProviderName(provider);
@@ -327,10 +346,12 @@ pub fn fallbackModelsForProvider(provider: []const u8) []const []const u8 {
     if (std.mem.eql(u8, canonical, "gemini")) return &gemini_fallback;
     if (std.mem.eql(u8, canonical, "vertex")) return &vertex_fallback;
     if (std.mem.eql(u8, canonical, "deepseek")) return &deepseek_fallback;
+    if (std.mem.eql(u8, canonical, "novita")) return &novita_fallback;
     if (std.mem.eql(u8, canonical, "ollama")) return &ollama_fallback;
     if (std.mem.eql(u8, canonical, "claude-cli")) return &claude_cli_fallback;
     if (std.mem.eql(u8, canonical, "codex-cli")) return &codex_support.codex_model_fallbacks;
     if (std.mem.eql(u8, canonical, "openai-codex")) return &codex_support.codex_model_fallbacks;
+    if (std.mem.eql(u8, canonical, "gemini-cli")) return &gemini_cli_fallback;
 
     // For providers without a curated fallback list, return a single-item fallback
     // based on the onboarding default model for that provider.
@@ -403,6 +424,11 @@ const deepseek_fallback = [_][]const u8{
     "deepseek-chat",
     "deepseek-reasoner",
 };
+const novita_fallback = [_][]const u8{
+    "moonshotai/kimi-k2.5",
+    "zai-org/glm-5",
+    "minimax/minimax-m2.5",
+};
 const ollama_fallback = [_][]const u8{
     "llama4",
     "llama3.2",
@@ -429,6 +455,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "groq", .key = "groq" },
     .{ .canonical = "deepseek", .key = "deepseek" },
     .{ .canonical = "gemini", .key = "google" },
+    .{ .canonical = "gemini-cli", .key = "google" },
     .{ .canonical = "vertex", .key = "google-vertex" },
     .{ .canonical = "z.ai", .key = "zai" },
     .{ .canonical = "glm", .key = "zhipuai" },
@@ -443,6 +470,7 @@ const models_dev_providers = [_]ModelsDevProvider{
     .{ .canonical = "minimax", .key = "minimax" },
     .{ .canonical = "cohere", .key = "cohere" },
     .{ .canonical = "perplexity", .key = "perplexity" },
+    .{ .canonical = "novita", .key = "novita-ai" },
     .{ .canonical = "nvidia", .key = "nvidia" },
     .{ .canonical = "bedrock", .key = "amazon-bedrock" },
     .{ .canonical = "copilot", .key = "github-copilot" },
@@ -503,6 +531,13 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
         return codex_support.loadCodexModels(allocator);
     }
 
+    // For the gemini CLI, prefer local discovery when available, then fall back
+    // to the shared models.dev/static pipeline used by other providers.
+    if (std.mem.eql(u8, canonical, "gemini-cli")) {
+        const dynamic = gemini_cli_mod.GeminiCliProvider.fetchModels(allocator);
+        if (dynamic.len > 0) return dynamic;
+    }
+
     if (fetchModelsFromNativeApi(allocator, canonical, api_key) catch null) |models| {
         return models;
     }
@@ -519,6 +554,7 @@ pub fn fetchModelsFromApi(allocator: std.mem.Allocator, provider: []const u8, ap
     // static fallback path for offline/test use.
     if (std.mem.eql(u8, canonical, "anthropic") or
         std.mem.eql(u8, canonical, "gemini") or
+        std.mem.eql(u8, canonical, "gemini-cli") or
         std.mem.eql(u8, canonical, "vertex") or
         std.mem.eql(u8, canonical, "deepseek") or
         std.mem.eql(u8, canonical, "ollama") or
@@ -2017,6 +2053,8 @@ pub fn runWizard(allocator: std.mem.Allocator) !void {
             try out.writeAll("  -> Uses local OAuth tokens from ~/.nullclaw/auth.json or ~/.codex/auth.json\n\n");
         } else if (std.mem.eql(u8, cfg.default_provider, "codex-cli")) {
             try out.writeAll("  -> Uses your local Codex CLI login (`codex login`)\n\n");
+        } else if (std.mem.eql(u8, cfg.default_provider, "gemini-cli")) {
+            try out.writeAll("  -> Uses your local Gemini CLI login (`gemini` -> Login with Google)\n\n");
         } else {
             try out.writeAll("  -> No API key required for this local provider\n\n");
         }
@@ -3025,6 +3063,7 @@ test "providerRequiresApiKeyForSetup marks local and OAuth providers as keyless"
     try std.testing.expect(!providerRequiresApiKeyForSetup("ollama", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("lm-studio", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("claude-cli", null));
+    try std.testing.expect(!providerRequiresApiKeyForSetup("gemini-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("codex-cli", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("openai-codex", null));
     try std.testing.expect(!providerRequiresApiKeyForSetup("custom:http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"));
@@ -3793,6 +3832,19 @@ test "printProviderNextSteps keeps codex-cli auth flow and interactive chat" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
 }
 
+test "printProviderNextSteps keeps gemini-cli auth flow and interactive chat" {
+    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer aw.deinit();
+
+    try printProviderNextSteps(&aw.writer, "gemini-cli", "GEMINI_API_KEY", false, false);
+
+    const rendered = aw.writer.buffer[0..aw.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Authenticate:  gemini") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Login with Google") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "nullclaw agent -m") == null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "Interactive chat:  nullclaw agent") != null);
+}
+
 test "providerEnvVar gemini aliases" {
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("gemini"));
     try std.testing.expectEqualStrings("GEMINI_API_KEY", providerEnvVar("google"));
@@ -3942,11 +3994,11 @@ test "catalog_providers names are unique" {
     }
 }
 
-test "wizard promptChoice returns default for out-of-range" {
-    // This tests the logic without actual I/O by validating the
-    // boundary: max providers is known_providers.len
-    try std.testing.expect(known_providers.len == 35);
-    // The wizard would clamp to default (0) for out of range input
+test "known_providers includes gemini-cli" {
+    for (known_providers) |provider| {
+        if (std.mem.eql(u8, provider.key, "gemini-cli")) return;
+    }
+    return error.TestUnexpectedResult;
 }
 
 test "findChannelOptionIndex supports number and key" {
@@ -4443,8 +4495,10 @@ test "fetchModels handles google alias" {
 test "modelsDevProviderKey maps known providers" {
     try std.testing.expectEqualStrings("anthropic", modelsDevProviderKey("claude-cli").?);
     try std.testing.expectEqualStrings("google", modelsDevProviderKey("gemini").?);
+    try std.testing.expectEqualStrings("google", modelsDevProviderKey("gemini-cli").?);
     try std.testing.expectEqualStrings("google-vertex", modelsDevProviderKey("vertex").?);
     try std.testing.expectEqualStrings("zai", modelsDevProviderKey("z.ai").?);
+    try std.testing.expectEqualStrings("novita-ai", modelsDevProviderKey("novita").?);
     try std.testing.expect(modelsDevProviderKey("ollama") == null);
 }
 

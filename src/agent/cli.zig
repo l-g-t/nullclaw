@@ -235,6 +235,7 @@ fn resolveProfileProvider(
         cfg.getProviderBaseUrl(profile.provider),
         cfg.getProviderNativeTools(profile.provider),
         cfg.getProviderUserAgent(profile.provider),
+        cfg.getProviderMaxStreamingPromptBytes(profile.provider),
     );
     return .{
         .provider = holder.provider(),

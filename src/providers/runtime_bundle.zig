@@ -13,6 +13,7 @@ const HolderPlan = struct {
     base_url: ?[]const u8,
     native_tools: bool,
     user_agent: ?[]const u8,
+    max_streaming_prompt_bytes: ?usize,
 };
 
 fn trimOptionalKey(raw_key: ?[]const u8) ?[]const u8 {
@@ -62,6 +63,7 @@ fn appendHolderPlan(
         .base_url = cfg.getProviderBaseUrl(provider_name),
         .native_tools = cfg.getProviderNativeTools(provider_name),
         .user_agent = cfg.getProviderUserAgent(provider_name),
+        .max_streaming_prompt_bytes = cfg.getProviderMaxStreamingPromptBytes(provider_name),
     });
     return plans.items.len;
 }
@@ -114,6 +116,7 @@ pub const RuntimeProviderBundle = struct {
             cfg.getProviderBaseUrl(cfg.default_provider),
             cfg.getProviderNativeTools(cfg.default_provider),
             cfg.getProviderUserAgent(cfg.default_provider),
+            cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
         );
 
         if (cfg.model_routes.len > 0) {
@@ -214,6 +217,7 @@ pub const RuntimeProviderBundle = struct {
                         plan.base_url,
                         plan.native_tools,
                         plan.user_agent,
+                        plan.max_streaming_prompt_bytes,
                     );
                     bundle.router_holders_initialized = i + 1;
                 }
@@ -284,6 +288,7 @@ pub const RuntimeProviderBundle = struct {
                     cfg.getProviderBaseUrl(provider_name),
                     cfg.getProviderNativeTools(provider_name),
                     cfg.getProviderUserAgent(provider_name),
+                    cfg.getProviderMaxStreamingPromptBytes(provider_name),
                 );
                 bundle.extra_holders_initialized = extra_i + 1;
                 bundle.reliable_entries.?[extra_i] = .{
@@ -310,6 +315,7 @@ pub const RuntimeProviderBundle = struct {
                         cfg.getProviderBaseUrl(cfg.default_provider),
                         cfg.getProviderNativeTools(cfg.default_provider),
                         cfg.getProviderUserAgent(cfg.default_provider),
+                        cfg.getProviderMaxStreamingPromptBytes(cfg.default_provider),
                     );
                     bundle.extra_holders_initialized = extra_i + 1;
                     bundle.reliable_entries.?[extra_i] = .{
@@ -514,6 +520,56 @@ test "RuntimeProviderBundle turns reliability api_keys into fallback providers" 
     try std.testing.expect(bundle.extra_keys != null);
     try std.testing.expectEqualStrings("key-b", bundle.extra_keys.?[0].?);
     try std.testing.expectEqualStrings("key-c", bundle.extra_keys.?[1].?);
+}
+
+test "RuntimeProviderBundle threads max_streaming_prompt_bytes to primary provider" {
+    // GAP-16: When the primary provider config has max_streaming_prompt_bytes set,
+    // the primary ProviderHolder must reflect the limit.
+    const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
+        .{ .name = "groq", .api_key = "gsk_test", .max_streaming_prompt_bytes = 65536 },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "groq",
+        .providers = &providers_cfg,
+    };
+    cfg.reliability.provider_retries = 0;
+
+    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
+    defer bundle.deinit();
+
+    // The primary holder must be a compatible provider with the limit wired in.
+    try std.testing.expect(bundle.primary_holder != null);
+    try std.testing.expect(bundle.primary_holder.?.* == .compatible);
+    try std.testing.expectEqual(@as(?usize, 65536), bundle.primary_holder.?.compatible.max_streaming_prompt_bytes);
+}
+
+test "RuntimeProviderBundle threads max_streaming_prompt_bytes to fallback providers" {
+    // GAP-17: Fallback providers listed in reliability.fallback_providers must
+    // also have their limit wired through from the per-provider config.
+    const providers_cfg = [_]@import("../config_types.zig").ProviderEntry{
+        .{ .name = "groq", .api_key = "gsk_fb", .max_streaming_prompt_bytes = 32768 },
+    };
+    var cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+        .default_provider = "openrouter",
+        .providers = &providers_cfg,
+    };
+    cfg.reliability.provider_retries = 1;
+    cfg.reliability.fallback_providers = &.{"groq"};
+
+    var bundle = try RuntimeProviderBundle.init(std.testing.allocator, &cfg);
+    defer bundle.deinit();
+
+    // The extra (fallback) holder must be a compatible provider with the limit.
+    try std.testing.expect(bundle.extra_holders != null);
+    try std.testing.expectEqual(@as(usize, 1), bundle.extra_holders.?.len);
+    try std.testing.expect(bundle.extra_holders.?[0] == .compatible);
+    try std.testing.expectEqual(@as(?usize, 32768), bundle.extra_holders.?[0].compatible.max_streaming_prompt_bytes);
 }
 
 test "RuntimeProviderBundle builds router-backed provider when model routes are configured" {

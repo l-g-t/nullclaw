@@ -246,6 +246,7 @@ pub const Agent = struct {
     default_model: []const u8 = "anthropic/claude-sonnet-4",
     profile_name: ?[]const u8 = null,
     profile_system_prompt: ?[]const u8 = null,
+    profile_system_prompt_owned: bool = false,
     model_routes: []const config_types.ModelRouteConfig = &.{},
     model_pinned_by_user: bool = false,
     last_route_trace: ?[]u8 = null,
@@ -511,6 +512,7 @@ pub const Agent = struct {
         if (self.bootstrap) |bp| bp.deinit();
         if (self.model_name_owned) self.allocator.free(self.model_name);
         if (self.default_provider_owned) self.allocator.free(self.default_provider);
+        if (self.profile_system_prompt_owned and self.profile_system_prompt != null) self.allocator.free(self.profile_system_prompt.?);
         if (self.workspace_dir_owned) self.allocator.free(self.workspace_dir);
         if (self.system_prompt_model_name) |model| self.allocator.free(model);
         if (self.last_route_trace) |trace| self.allocator.free(trace);
@@ -1553,8 +1555,17 @@ pub const Agent = struct {
         const turn_model_name_owned = !std.mem.eql(u8, turn_model_name, self.model_name);
         defer if (turn_model_name_owned) self.allocator.free(turn_model_name);
 
+        var cfg_for_prompt_opt: ?Config = Config.load(self.allocator) catch null;
+        defer if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded.deinit();
+        const cfg_for_prompt_ptr: ?*const Config = if (cfg_for_prompt_opt) |*cfg_loaded| cfg_loaded else null;
+
         // Inject system prompt on first turn (or when tracked workspace files changed).
-        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(self.allocator, self.workspace_dir, self.bootstrap) catch null;
+        const workspace_fp: ?u64 = prompt.workspacePromptFingerprint(
+            self.allocator,
+            self.workspace_dir,
+            self.bootstrap,
+            if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
+        ) catch null;
         if (self.has_system_prompt and workspace_fp != null and self.workspace_prompt_fingerprint != workspace_fp) {
             self.has_system_prompt = false;
         }
@@ -1576,13 +1587,9 @@ pub const Agent = struct {
                 self.system_prompt_conversation_context_fingerprint != turn_conversation_context_fingerprint);
 
         if (!self.has_system_prompt or conversation_context_changed) {
-            var cfg_for_caps_opt: ?Config = Config.load(self.allocator) catch null;
-            defer if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded.deinit();
-            const cfg_for_caps_ptr: ?*const Config = if (cfg_for_caps_opt) |*cfg_loaded| cfg_loaded else null;
-
             const capabilities_section = capabilities_mod.buildPromptSection(
                 self.allocator,
-                cfg_for_caps_ptr,
+                cfg_for_prompt_ptr,
                 self.tools,
             ) catch null;
             defer if (capabilities_section) |section| self.allocator.free(section);
@@ -1591,9 +1598,11 @@ pub const Agent = struct {
                 .workspace_dir = self.workspace_dir,
                 .model_name = turn_model_name,
                 .tools = self.tools,
+                .timezone = if (cfg_for_prompt_ptr) |cfg_ptr| cfg_ptr.agent.timezone else "UTC",
                 .capabilities_section = capabilities_section,
                 .conversation_context = self.conversation_context,
                 .bootstrap_provider = self.bootstrap,
+                .identity_config = if (cfg_for_prompt_ptr) |cfg| cfg.identity else null,
             });
             const final_system = if (self.profile_system_prompt) |profile_prompt|
                 if (profile_prompt.len > 0) blk: {

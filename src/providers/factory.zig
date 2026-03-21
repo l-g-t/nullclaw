@@ -10,6 +10,7 @@ const openrouter = @import("openrouter.zig");
 const compatible = @import("compatible.zig");
 const claude_cli = @import("claude_cli.zig");
 const codex_cli = @import("codex_cli.zig");
+const gemini_cli = @import("gemini_cli.zig");
 const openai_codex = @import("openai_codex.zig");
 const provider_names = @import("../provider_names.zig");
 
@@ -24,6 +25,7 @@ pub const ProviderKind = enum {
     compatible_provider,
     claude_cli_provider,
     codex_cli_provider,
+    gemini_cli_provider,
     openai_codex_provider,
     unknown,
 };
@@ -48,8 +50,8 @@ const CompatProvider = struct {
     /// When set, cap max_tokens in non-streaming requests to this value.
     /// Fireworks rejects max_tokens > 4096 when stream=false.
     max_tokens_non_streaming: ?u32 = null,
-    /// When true, include `"thinking":{"type":"enabled"}` in request bodies
-    /// when reasoning_effort is set. Required by Z.AI/GLM thinking models.
+    /// When true, include `"thinking":{"type":"enabled|disabled"}` in request
+    /// bodies so Z.AI/GLM models do not fall back to server-side defaults.
     thinking_param: bool = false,
     /// When true, include `"enable_thinking":true` in request bodies
     /// when reasoning_effort is set. Required by Qwen (DashScope compatible mode).
@@ -95,10 +97,10 @@ const compat_providers = [_]CompatProvider{
     // ── China Providers — general ─────────────────────────────────────────
     .{ .name = "moonshot", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
+    .{ .name = "glm", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zhipu", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "z.ai", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
     .{ .name = "minimax", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "qwen", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
     .{ .name = "dashscope", .url = "https://dashscope.aliyuncs.com/compatible-mode/v1", .display = "Qwen", .enable_thinking_param = true },
@@ -107,15 +109,18 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "doubao", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
     .{ .name = "volcengine", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
     .{ .name = "ark", .url = "https://ark.cn-beijing.volces.com/api/v3", .display = "Doubao" },
+    .{ .name = "hunyuan", .url = "https://api.hunyuan.cloud.tencent.com/v1", .display = "Hunyuan" },
+    .{ .name = "tencent", .url = "https://api.hunyuan.cloud.tencent.com/v1", .display = "Hunyuan" },
+    .{ .name = "baichuan", .url = "https://api.baichuan-ai.com/v1", .display = "Baichuan" },
 
     // ── China Providers — CN endpoints ────────────────────────────────────
     .{ .name = "moonshot-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
     .{ .name = "kimi-cn", .url = "https://api.moonshot.cn/v1", .display = "Moonshot" },
-    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = true, .thinking_param = false, .disable_streaming = true },
-    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = true, .thinking_param = false, .disable_streaming = true },
-    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = true, .thinking_param = false, .disable_streaming = true },
-    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
+    .{ .name = "glm-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zhipu-cn", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "bigmodel", .url = "https://open.bigmodel.cn/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "z.ai-cn", .url = "https://open.bigmodel.cn/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
     .{ .name = "minimax-cn", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimaxi", .url = "https://api.minimaxi.com/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
 
@@ -124,10 +129,10 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "moonshot-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-intl", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
     .{ .name = "kimi-global", .url = "https://api.moonshot.ai/v1", .display = "Moonshot" },
-    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .native_tools = false, .thinking_param = true },
-    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
-    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .native_tools = false, .thinking_param = true },
+    .{ .name = "glm-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zhipu-global", .url = "https://api.z.ai/api/paas/v4", .display = "GLM", .no_responses_fallback = true, .thinking_param = true, .disable_streaming = true },
+    .{ .name = "zai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
+    .{ .name = "z.ai-global", .url = "https://api.z.ai/api/coding/paas/v4", .display = "Z.AI", .thinking_param = true, .disable_streaming = true },
     .{ .name = "minimax-intl", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimax-io", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
     .{ .name = "minimax-global", .url = "https://api.minimax.io/v1", .display = "MiniMax", .no_responses_fallback = true, .merge_system_into_user = true, .native_tools = false, .reasoning_split_param = true },
@@ -156,6 +161,8 @@ const compat_providers = [_]CompatProvider{
     .{ .name = "build.nvidia.com", .url = "https://integrate.api.nvidia.com/v1", .display = "NVIDIA NIM" },
     .{ .name = "ovhcloud", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
     .{ .name = "ovh", .url = "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", .display = "OVHcloud" },
+    .{ .name = "novita", .url = "https://api.novita.ai/openai/v1", .display = "Novita" },
+    .{ .name = "novita-ai", .url = "https://api.novita.ai/openai/v1", .display = "Novita" },
 
     // ── Local Servers ─────────────────────────────────────────────────────
     .{ .name = "lmstudio", .url = "http://localhost:1234/v1", .display = "LM Studio" },
@@ -233,6 +240,7 @@ const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
     .{ "google-vertex", .vertex_provider },
     .{ "claude-cli", .claude_cli_provider },
     .{ "codex-cli", .codex_cli_provider },
+    .{ "gemini-cli", .gemini_cli_provider },
     .{ "openai-codex", .openai_codex_provider },
 });
 
@@ -294,6 +302,7 @@ pub const ProviderHolder = union(enum) {
     compatible: compatible.OpenAiCompatibleProvider,
     claude_cli: claude_cli.ClaudeCliProvider,
     codex_cli: codex_cli.CodexCliProvider,
+    gemini_cli: gemini_cli.GeminiCliProvider,
     openai_codex: openai_codex.OpenAiCodexProvider,
 
     /// Obtain the vtable-based Provider interface from whichever variant is active.
@@ -308,6 +317,7 @@ pub const ProviderHolder = union(enum) {
             .compatible => |*p| p.provider(),
             .claude_cli => |*p| p.provider(),
             .codex_cli => |*p| p.provider(),
+            .gemini_cli => |*p| p.provider(),
             .openai_codex => |*p| p.provider(),
         };
     }
@@ -326,6 +336,7 @@ pub const ProviderHolder = union(enum) {
         base_url: ?[]const u8,
         native_tools: bool,
         user_agent: ?[]const u8,
+        max_streaming_prompt_bytes: ?usize,
     ) ProviderHolder {
         const kind = classifyProvider(provider_name);
         return switch (kind) {
@@ -351,12 +362,13 @@ pub const ProviderHolder = union(enum) {
                 prov.owned_base_url = azure_url;
                 prov.custom_header = "api-key";
                 if (!native_tools) prov.native_tools = false;
+                if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
                 break :blk .{ .compatible = prov };
             },
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
             .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, base_url) },
             .ollama_provider => blk: {
-                var prov = ollama.OllamaProvider.init(allocator, base_url);
+                var prov = ollama.OllamaProvider.init(allocator, base_url, api_key);
                 prov.native_tools = native_tools;
                 break :blk .{ .ollama = prov };
             },
@@ -392,8 +404,9 @@ pub const ProviderHolder = union(enum) {
                     if (c.disable_streaming) prov.disable_streaming = true;
                 }
 
-                // Apply config-level native_tools override (can only force to false).
+                // Apply config-level overrides.
                 if (!native_tools) prov.native_tools = false;
+                if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
 
                 break :blk .{ .compatible = prov };
             },
@@ -403,6 +416,10 @@ pub const ProviderHolder = union(enum) {
                 .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
             .codex_cli_provider => if (codex_cli.CodexCliProvider.init(allocator, null)) |p|
                 .{ .codex_cli = p }
+            else |_|
+                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+            .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
+                .{ .gemini_cli = p }
             else |_|
                 .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
             .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
@@ -418,6 +435,7 @@ pub const ProviderHolder = union(enum) {
                     user_agent,
                 );
                 prov.native_tools = native_tools;
+                if (max_streaming_prompt_bytes) |limit| prov.max_streaming_prompt_bytes = limit;
                 break :blk .{ .compatible = prov };
             } else .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
         };
@@ -448,6 +466,7 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("poe") == .compatible_provider);
     try std.testing.expect(classifyProvider("custom:https://example.com") == .compatible_provider);
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
+    try std.testing.expect(classifyProvider("gemini-cli") == .gemini_cli_provider);
     try std.testing.expect(classifyProvider("nonexistent") == .unknown);
 }
 
@@ -511,6 +530,8 @@ test "compatibleProviderUrl new providers" {
     try std.testing.expectEqualStrings("https://api.siliconflow.cn/v1", compatibleProviderUrl("siliconflow").?);
     try std.testing.expectEqualStrings("https://router.shengsuanyun.com/api/v1", compatibleProviderUrl("shengsuanyun").?);
     try std.testing.expectEqualStrings("https://oai.endpoints.kepler.ai.cloud.ovh.net/v1", compatibleProviderUrl("ovhcloud").?);
+    try std.testing.expectEqualStrings("https://api.novita.ai/openai/v1", compatibleProviderUrl("novita").?);
+    try std.testing.expectEqualStrings("https://api.novita.ai/openai/v1", compatibleProviderUrl("novita-ai").?);
     try std.testing.expectEqualStrings("https://ark.ap-southeast.bytepluses.com/api/v3", compatibleProviderUrl("byteplus").?);
     try std.testing.expectEqualStrings("https://chutes.ai/api/v1", compatibleProviderUrl("chutes").?);
     try std.testing.expectEqualStrings("https://api.kimi.com/coding/v1", compatibleProviderUrl("kimi-code").?);
@@ -549,6 +570,9 @@ test "compatibleProviderUrl CN/intl variants" {
     try std.testing.expectEqualStrings("https://api.z.ai/api/paas/v4", compatibleProviderUrl("glm-global").?);
     try std.testing.expectEqualStrings("https://api.minimaxi.com/v1", compatibleProviderUrl("minimax-cn").?);
     try std.testing.expectEqualStrings("https://api.minimax.io/v1", compatibleProviderUrl("minimax-intl").?);
+    try std.testing.expectEqualStrings("https://api.hunyuan.cloud.tencent.com/v1", compatibleProviderUrl("hunyuan").?);
+    try std.testing.expectEqualStrings("https://api.hunyuan.cloud.tencent.com/v1", compatibleProviderUrl("tencent").?);
+    try std.testing.expectEqualStrings("https://api.baichuan-ai.com/v1", compatibleProviderUrl("baichuan").?);
 }
 
 test "nvidia resolves to correct URL" {
@@ -579,6 +603,11 @@ test "new providers display names" {
     try std.testing.expectEqualStrings("Hugging Face", compatibleProviderDisplayName("huggingface"));
     try std.testing.expectEqualStrings("vLLM", compatibleProviderDisplayName("vllm"));
     try std.testing.expectEqualStrings("OVHcloud", compatibleProviderDisplayName("ovhcloud"));
+    try std.testing.expectEqualStrings("Hunyuan", compatibleProviderDisplayName("hunyuan"));
+    try std.testing.expectEqualStrings("Hunyuan", compatibleProviderDisplayName("tencent"));
+    try std.testing.expectEqualStrings("Baichuan", compatibleProviderDisplayName("baichuan"));
+    try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita"));
+    try std.testing.expectEqualStrings("Novita", compatibleProviderDisplayName("novita-ai"));
     try std.testing.expectEqualStrings("Custom", compatibleProviderDisplayName("nonexistent"));
     try std.testing.expectEqualStrings("Telnyx", compatibleProviderDisplayName("telnyx"));
 }
@@ -591,14 +620,42 @@ test "new providers classify as compatible" {
     try std.testing.expect(classifyProvider("lm-studio") == .compatible_provider);
     try std.testing.expect(classifyProvider("astrai") == .compatible_provider);
     try std.testing.expect(classifyProvider("telnyx") == .compatible_provider);
+    try std.testing.expect(classifyProvider("hunyuan") == .compatible_provider);
+    try std.testing.expect(classifyProvider("tencent") == .compatible_provider);
+    try std.testing.expect(classifyProvider("baichuan") == .compatible_provider);
+    try std.testing.expect(classifyProvider("novita") == .compatible_provider);
+    try std.testing.expect(classifyProvider("novita-ai") == .compatible_provider);
 }
 
 test "findCompatProvider returns correct flags" {
     // GLM has no_responses_fallback and thinking_param
     const glm = findCompatProvider("glm").?;
     try std.testing.expect(glm.no_responses_fallback);
+    try std.testing.expect(glm.native_tools);
     try std.testing.expect(!glm.merge_system_into_user);
     try std.testing.expect(glm.thinking_param);
+
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+    for (native_tool_aliases) |provider_name| {
+        const provider = findCompatProvider(provider_name).?;
+        try std.testing.expect(provider.native_tools);
+        try std.testing.expect(provider.disable_streaming);
+        try std.testing.expect(provider.thinking_param);
+    }
 
     // MiniMax has both flags
     const minimax = findCompatProvider("minimax").?;
@@ -626,9 +683,88 @@ test "findCompatProvider returns correct flags" {
     try std.testing.expectEqual(@as(?u32, 4096), fireworks.max_tokens_non_streaming);
 }
 
+test "fromConfig keeps native_tools enabled for z.ai/glm aliases" {
+    const alloc = std.testing.allocator;
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+
+    for (native_tool_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, true, null, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(holder.compatible.native_tools);
+    }
+}
+
+test "fromConfig disables streaming for z.ai/glm aliases" {
+    const alloc = std.testing.allocator;
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+
+    for (native_tool_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, true, null, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(holder.compatible.disable_streaming);
+        try std.testing.expect(!holder.provider().supportsStreaming());
+    }
+}
+
+test "fromConfig still allows native_tools opt-out for z.ai/glm aliases" {
+    const alloc = std.testing.allocator;
+    const native_tool_aliases = [_][]const u8{
+        "glm",
+        "zhipu",
+        "zai",
+        "z.ai",
+        "glm-cn",
+        "zhipu-cn",
+        "bigmodel",
+        "zai-cn",
+        "z.ai-cn",
+        "glm-global",
+        "zhipu-global",
+        "zai-global",
+        "z.ai-global",
+    };
+
+    for (native_tool_aliases) |provider_name| {
+        var holder = ProviderHolder.fromConfig(alloc, provider_name, "key", null, false, null, null);
+        defer holder.deinit();
+        try std.testing.expect(holder == .compatible);
+        try std.testing.expect(!holder.compatible.native_tools);
+    }
+}
+
 test "fromConfig applies no_responses_fallback flag" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(!h.compatible.supports_responses_fallback);
@@ -636,7 +772,7 @@ test "fromConfig applies no_responses_fallback flag" {
 
 test "fromConfig applies thinking_param flag for GLM" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "glm", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.thinking_param);
@@ -644,7 +780,7 @@ test "fromConfig applies thinking_param flag for GLM" {
 
 test "fromConfig thinking_param false for non-GLM providers" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "groq", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "groq", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(!h.compatible.thinking_param);
@@ -652,7 +788,7 @@ test "fromConfig thinking_param false for non-GLM providers" {
 
 test "fromConfig applies enable_thinking_param for Qwen" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "qwen", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "qwen", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.enable_thinking_param);
@@ -660,7 +796,7 @@ test "fromConfig applies enable_thinking_param for Qwen" {
 
 test "fromConfig applies reasoning_split_param for MiniMax" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.reasoning_split_param);
@@ -668,7 +804,7 @@ test "fromConfig applies reasoning_split_param for MiniMax" {
 
 test "fromConfig applies merge_system_into_user flag" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.merge_system_into_user);
@@ -678,7 +814,7 @@ test "fromConfig applies merge_system_into_user flag" {
 test "fromConfig inherits native_tools=false from table" {
     const alloc = std.testing.allocator;
     // minimax has native_tools = false in table
-    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "minimax", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(!h.compatible.native_tools);
@@ -686,18 +822,41 @@ test "fromConfig inherits native_tools=false from table" {
 
 test "fromConfig applies native_tools override for ollama" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "ollama", null, null, false, null);
+    var h = ProviderHolder.fromConfig(alloc, "ollama", null, null, false, null, null);
     defer h.deinit();
     try std.testing.expect(h == .ollama);
     try std.testing.expect(!h.provider().supportsNativeTools());
 }
 
+test "fromConfig passes api_key through to ollama" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "ollama", "ollama-key", "https://api.ollama.example", true, null, null);
+    defer h.deinit();
+    try std.testing.expect(h == .ollama);
+    try std.testing.expectEqualStrings("ollama-key", h.ollama.api_key.?);
+    try std.testing.expectEqualStrings("https://api.ollama.example", h.ollama.base_url);
+}
+
 test "fromConfig applies max_tokens_non_streaming from table" {
     const alloc = std.testing.allocator;
-    var h = ProviderHolder.fromConfig(alloc, "fireworks", "key", null, true, null);
+    var h = ProviderHolder.fromConfig(alloc, "fireworks", "key", null, true, null, null);
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expectEqual(@as(?u32, 4096), h.compatible.max_tokens_non_streaming);
+}
+
+test "fromConfig threads max_streaming_prompt_bytes to compatible provider" {
+    const alloc = std.testing.allocator;
+    // null -> no limit
+    var h1 = ProviderHolder.fromConfig(alloc, "groq", "key", null, true, null, null);
+    defer h1.deinit();
+    try std.testing.expect(h1 == .compatible);
+    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
+    // non-null -> limit applied
+    var h2 = ProviderHolder.fromConfig(alloc, "groq", "key", null, true, null, 65536);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 65536), h2.compatible.max_streaming_prompt_bytes);
 }
 
 test "detectProviderByApiKey openrouter" {
@@ -754,66 +913,121 @@ test "ProviderHolder tagged union has all expected fields" {
     try std.testing.expect(@hasField(ProviderHolder, "compatible"));
     try std.testing.expect(@hasField(ProviderHolder, "claude_cli"));
     try std.testing.expect(@hasField(ProviderHolder, "codex_cli"));
+    try std.testing.expect(@hasField(ProviderHolder, "gemini_cli"));
     try std.testing.expect(@hasField(ProviderHolder, "openai_codex"));
 }
 
 test "ProviderHolder.fromConfig routes to correct variant" {
     const alloc = std.testing.allocator;
     // anthropic
-    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true, null);
+    var h1 = ProviderHolder.fromConfig(alloc, "anthropic", "sk-test", null, true, null, null);
     defer h1.deinit();
     try std.testing.expect(h1 == .anthropic);
     // openai
-    var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null);
+    var h2 = ProviderHolder.fromConfig(alloc, "openai", "sk-test", null, true, null, null);
     defer h2.deinit();
     try std.testing.expect(h2 == .openai);
     // azure openai
-    var h2a = ProviderHolder.fromConfig(alloc, "azure", "test-key", "https://test.openai.azure.com", true, null);
+    var h2a = ProviderHolder.fromConfig(alloc, "azure", "test-key", "https://test.openai.azure.com", true, null, null);
     defer h2a.deinit();
     try std.testing.expect(h2a == .compatible);
     try std.testing.expectEqualStrings("https://test.openai.azure.com/openai/v1", h2a.compatible.base_url);
     try std.testing.expect(h2a.compatible.auth_style == .custom);
     try std.testing.expectEqualStrings("api-key", h2a.compatible.custom_header.?);
     // gemini
-    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null);
+    var h3 = ProviderHolder.fromConfig(alloc, "gemini", "key", null, true, null, null);
     defer h3.deinit();
     try std.testing.expect(h3 == .gemini);
     // vertex
-    var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models", true, null);
+    var h3b = ProviderHolder.fromConfig(alloc, "vertex", "ya29.token", "https://aiplatform.googleapis.com/v1/projects/p/locations/global/publishers/google/models", true, null, null);
     defer h3b.deinit();
     try std.testing.expect(h3b == .vertex);
     // ollama
-    var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null);
+    var h4 = ProviderHolder.fromConfig(alloc, "ollama", null, null, true, null, null);
     defer h4.deinit();
     try std.testing.expect(h4 == .ollama);
     // openrouter
-    var h5 = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test", null, true, null);
+    var h5 = ProviderHolder.fromConfig(alloc, "openrouter", "sk-or-test", null, true, null, null);
     defer h5.deinit();
     try std.testing.expect(h5 == .openrouter);
     // compatible (groq)
-    var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test", null, true, null);
+    var h6 = ProviderHolder.fromConfig(alloc, "groq", "gsk_test", null, true, null, null);
     defer h6.deinit();
     try std.testing.expect(h6 == .compatible);
     // compatible (telnyx from built-in table URL)
-    var h6b = ProviderHolder.fromConfig(alloc, "telnyx", "test-key", null, true, null);
+    var h6b = ProviderHolder.fromConfig(alloc, "telnyx", "test-key", null, true, null, null);
     defer h6b.deinit();
     try std.testing.expect(h6b == .compatible);
     try std.testing.expectEqualStrings("https://api.telnyx.com/v2/ai", h6b.compatible.base_url);
     // openai-codex
-    var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true, null);
+    var h7 = ProviderHolder.fromConfig(alloc, "openai-codex", null, null, true, null, null);
     defer h7.deinit();
     try std.testing.expect(h7 == .openai_codex);
     // unknown falls back to openrouter
-    var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null, true, null);
+    var h8 = ProviderHolder.fromConfig(alloc, "nonexistent", "key", null, true, null, null);
     defer h8.deinit();
     try std.testing.expect(h8 == .openrouter);
     // anthropic-custom prefix
-    var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null, true, null);
+    var h9 = ProviderHolder.fromConfig(alloc, "anthropic-custom:https://my-api.example.com", "sk-test", null, true, null, null);
     defer h9.deinit();
     try std.testing.expect(h9 == .anthropic);
 }
 
 test "compat_providers table count" {
     // Verify we have the expected number of entries (guard against accidental deletions).
-    try std.testing.expect(compat_providers.len >= 89);
+    try std.testing.expect(compat_providers.len >= 92);
+}
+
+test "fromConfig threads max_streaming_prompt_bytes to azure branch" {
+    // GAP-13: The azure branch (azure_openai_provider) must thread the limit
+    // through to the underlying compatible provider just like the compatible_provider
+    // branch does.
+    const alloc = std.testing.allocator;
+    // null → no limit
+    var h1 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, null);
+    defer h1.deinit();
+    try std.testing.expect(h1 == .compatible);
+    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
+    // non-null → limit applied
+    var h2 = ProviderHolder.fromConfig(alloc, "azure-openai", "key", "https://res.openai.azure.com", true, null, 65536);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 65536), h2.compatible.max_streaming_prompt_bytes);
+}
+
+test "fromConfig threads max_streaming_prompt_bytes to unknown-with-base-url branch" {
+    // GAP-14: The unknown branch falls back to an OpenAI-compatible provider
+    // when base_url is set. That provider must also receive the limit.
+    const alloc = std.testing.allocator;
+    // null → no limit
+    var h1 = ProviderHolder.fromConfig(alloc, "my-local-llm", "key", "http://localhost:9999/v1", true, null, null);
+    defer h1.deinit();
+    try std.testing.expect(h1 == .compatible);
+    try std.testing.expectEqual(@as(?usize, null), h1.compatible.max_streaming_prompt_bytes);
+    // non-null → limit applied
+    var h2 = ProviderHolder.fromConfig(alloc, "my-local-llm", "key", "http://localhost:9999/v1", true, null, 8192);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 8192), h2.compatible.max_streaming_prompt_bytes);
+}
+
+test "fromConfig threads max_streaming_prompt_bytes zero value" {
+    // GAP-15: A limit of 0 must be treated as "always skip streaming" (not as
+    // null / no-limit).  The value 0 is semantically valid: every request is
+    // at or above zero bytes.
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "groq", "key", null, true, null, 0);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqual(@as(?usize, 0), h.compatible.max_streaming_prompt_bytes);
+    // Azure branch
+    var h2 = ProviderHolder.fromConfig(alloc, "azure", "key", "https://res.openai.azure.com", true, null, 0);
+    defer h2.deinit();
+    try std.testing.expect(h2 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 0), h2.compatible.max_streaming_prompt_bytes);
+    // Unknown-with-base-url branch
+    var h3 = ProviderHolder.fromConfig(alloc, "custom-llm", "key", "http://localhost:7777/v1", true, null, 0);
+    defer h3.deinit();
+    try std.testing.expect(h3 == .compatible);
+    try std.testing.expectEqual(@as(?usize, 0), h3.compatible.max_streaming_prompt_bytes);
 }

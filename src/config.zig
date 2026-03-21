@@ -1,4 +1,5 @@
 const std = @import("std");
+const fs_compat = @import("fs_compat.zig");
 const platform = @import("platform.zig");
 const provider_names = @import("provider_names.zig");
 const secrets = @import("security/secrets.zig");
@@ -316,6 +317,15 @@ pub const Config = struct {
     pub fn getProviderUserAgent(self: *const Config, name: []const u8) ?[]const u8 {
         for (self.providers) |e| {
             if (provider_names.providerNamesMatch(e.name, name)) return e.user_agent;
+        }
+        return null;
+    }
+
+    /// Look up the optional streaming prompt byte limit for a provider.
+    /// Returns null if provider is not in the list or has no limit set (no limit = always stream).
+    pub fn getProviderMaxStreamingPromptBytes(self: *const Config, name: []const u8) ?usize {
+        for (self.providers) |e| {
+            if (provider_names.providerNamesMatch(e.name, name)) return e.max_streaming_prompt_bytes;
         }
         return null;
     }
@@ -872,6 +882,13 @@ pub const Config = struct {
                         has_field = true;
                     }
                 }
+                if (comptime @hasField(ProviderEntry, "max_streaming_prompt_bytes")) {
+                    if (entry.max_streaming_prompt_bytes) |mb| {
+                        if (has_field) try w.print(", ", .{});
+                        try w.print("\"max_streaming_prompt_bytes\": {d}", .{mb});
+                        has_field = true;
+                    }
+                }
                 try w.print("}}", .{});
                 if (i + 1 < self.providers.len) try w.print(",", .{});
                 try w.print("\n", .{});
@@ -1056,6 +1073,7 @@ pub const Config = struct {
             .compaction_max_source_chars = self.agent.compaction_max_source_chars,
             .status_show_emojis = self.agent.status_show_emojis,
             .message_timeout_secs = self.agent.message_timeout_secs,
+            .timezone = self.agent.timezone,
             .vision_disabled_models = self.agent.vision_disabled_models,
             .auto_disable_vision_on_error = self.agent.auto_disable_vision_on_error,
         }, .{})});
@@ -1179,6 +1197,7 @@ pub const Config = struct {
         InvalidDefaultModelPrimary,
         NoDefaultModel,
         TemperatureOutOfRange,
+        InvalidAgentTimezone,
         InvalidPort,
         InvalidRetryCount,
         InvalidBackoffMs,
@@ -1228,6 +1247,9 @@ pub const Config = struct {
         }
         if (self.default_temperature < 0.0 or self.default_temperature > 2.0) {
             return ValidationError.TemperatureOutOfRange;
+        }
+        if (!config_types.AgentConfig.isValidTimezone(self.agent.timezone)) {
+            return ValidationError.InvalidAgentTimezone;
         }
         if (self.gateway.port == 0) {
             return ValidationError.InvalidPort;
@@ -1377,6 +1399,7 @@ pub const Config = struct {
                 .{},
             ),
             ValidationError.TemperatureOutOfRange => std.debug.print("Config error: temperature must be between 0.0 and 2.0.\n", .{}),
+            ValidationError.InvalidAgentTimezone => std.debug.print("Config error: agent.timezone must be 'UTC' or a fixed offset like 'UTC+08:00'.\n", .{}),
             ValidationError.InvalidPort => std.debug.print("Config error: gateway port must be non-zero.\n", .{}),
             ValidationError.InsecurePlaintextSecrets => std.debug.print("Config error: secrets.encrypt=false is not allowed because it stores secrets in plaintext.\n", .{}),
             ValidationError.InvalidRetryCount => std.debug.print("Config error: provider_retries must be <= 100.\n", .{}),
@@ -1455,7 +1478,7 @@ pub const Config = struct {
     }
 
     pub fn scaffoldAgentWorkspace(allocator: std.mem.Allocator, workspace_path: []const u8) !void {
-        std.fs.cwd().makePath(workspace_path) catch |err| switch (err) {
+        fs_compat.makePath(workspace_path) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -1579,6 +1602,17 @@ test "validation rejects bad temperature" {
         .allocator = std.testing.allocator,
     };
     try std.testing.expectError(Config.ValidationError.TemperatureOutOfRange, cfg.validate());
+}
+
+test "validation rejects invalid agent timezone" {
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .default_model = "x",
+        .agent = .{ .timezone = "Asia/Shanghai" },
+        .allocator = std.testing.allocator,
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidAgentTimezone, cfg.validate());
 }
 
 test "json parse reads reliability fallback providers and model fallbacks" {
@@ -2209,6 +2243,7 @@ test "save roundtrip preserves extended config sections" {
     cfg.agent.compaction_max_source_chars = 9000;
     cfg.agent.status_show_emojis = false;
     cfg.agent.message_timeout_secs = 60;
+    cfg.agent.timezone = "UTC+08:00";
 
     cfg.memory.search.provider = "openai";
     cfg.memory.search.model = "text-embedding-3-small";
@@ -2331,6 +2366,7 @@ test "save roundtrip preserves extended config sections" {
     try std.testing.expectEqual(@as(u64, 123), loaded.scheduler.agent_timeout_secs);
     try std.testing.expect(loaded.agent.parallel_tools);
     try std.testing.expect(!loaded.agent.status_show_emojis);
+    try std.testing.expectEqualStrings("UTC+08:00", loaded.agent.timezone);
 
     try std.testing.expectEqualStrings("openai", loaded.memory.search.provider);
     try std.testing.expect(loaded.memory.response_cache.enabled);
@@ -3213,7 +3249,7 @@ test "json parse agent section" {
     defer arena.deinit();
     const allocator = arena.allocator();
     const json =
-        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false, "vision_disabled_models": ["router/text-only"], "auto_disable_vision_on_error": false}}
+        \\{"agent": {"compact_context": true, "max_tool_iterations": 20, "max_history_messages": 80, "parallel_tools": true, "tool_dispatcher": "xml", "token_limit": 64000, "status_show_emojis": false, "timezone": "UTC+08:00", "vision_disabled_models": ["router/text-only"], "auto_disable_vision_on_error": false}}
     ;
     var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
     try cfg.parseJson(json);
@@ -3225,6 +3261,7 @@ test "json parse agent section" {
     try std.testing.expectEqual(@as(u64, 64_000), cfg.agent.token_limit);
     try std.testing.expect(cfg.agent.token_limit_explicit);
     try std.testing.expect(!cfg.agent.status_show_emojis);
+    try std.testing.expectEqualStrings("UTC+08:00", cfg.agent.timezone);
     try std.testing.expectEqual(@as(usize, 1), cfg.agent.vision_disabled_models.len);
     try std.testing.expectEqualStrings("router/text-only", cfg.agent.vision_disabled_models[0]);
     try std.testing.expect(!cfg.agent.auto_disable_vision_on_error);
@@ -3240,6 +3277,7 @@ test "json parse agent token_limit explicit remains false when omitted" {
     try std.testing.expectEqual(config_types.DEFAULT_AGENT_TOKEN_LIMIT, cfg.agent.token_limit);
     try std.testing.expect(!cfg.agent.token_limit_explicit);
     try std.testing.expect(cfg.agent.status_show_emojis);
+    try std.testing.expectEqualStrings("UTC", cfg.agent.timezone);
 }
 
 test "json parse composio section" {
@@ -4485,6 +4523,161 @@ test "save escapes provider string fields" {
     try std.testing.expectEqualStrings("nullclaw \"agent\"", openai.get("user_agent").?.string);
 }
 
+test "parseJson reads max_streaming_prompt_bytes from provider config" {
+    // GAP-1/2: Regression — field was missing from config_parse.zig so setting
+    // max_streaming_prompt_bytes in config.json had no effect.
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"groq":{"api_key":"gsk_test","max_streaming_prompt_bytes":524288},"infini-ai":{"api_key":"key"}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    // Manually free provider allocations made by parseJson (same pattern as
+    // existing "json parse providers section" test — Config.deinit() only
+    // tears down the arena, which is not used here).
+    defer {
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.base_url) |b| allocator.free(b);
+            if (e.user_agent) |ua| allocator.free(ua);
+        }
+        allocator.free(cfg.providers);
+    }
+
+    // Provider with field set → value returned.
+    try std.testing.expectEqual(@as(?usize, 524288), cfg.getProviderMaxStreamingPromptBytes("groq"));
+    // Provider without field → null (no limit, always stream).
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("infini-ai"));
+    // Unrecognised provider → null.
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("unknown"));
+}
+
+test "parseJson ignores negative max_streaming_prompt_bytes" {
+    // A negative integer in the JSON should not crash and should leave the
+    // field at its default (null).
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"models":{"providers":{"bad":{"api_key":"x","max_streaming_prompt_bytes":-1}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    // Manually free provider allocations (same pattern as existing passing
+    // "json parse providers section" test — no arena in use here).
+    defer {
+        for (cfg.providers) |e| {
+            allocator.free(e.name);
+            if (e.api_key) |k| allocator.free(k);
+            if (e.base_url) |b| allocator.free(b);
+            if (e.user_agent) |ua| allocator.free(ua);
+        }
+        allocator.free(cfg.providers);
+    }
+
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("bad"));
+}
+
+test "save writes max_streaming_prompt_bytes when set" {
+    // GAP-3/4: save() must emit the field so it survives a config write.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "groq", .api_key = "gsk_test", .max_streaming_prompt_bytes = 524288 },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    // The raw JSON must contain the field.
+    try std.testing.expect(std.mem.indexOf(u8, content, "\"max_streaming_prompt_bytes\": 524288") != null);
+}
+
+test "save omits max_streaming_prompt_bytes when null" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "groq", .api_key = "gsk_test" },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    // When null the field should be absent from the JSON (no "max_streaming").
+    try std.testing.expect(std.mem.indexOf(u8, content, "max_streaming_prompt_bytes") == null);
+}
+
+test "save and parseJson round-trip max_streaming_prompt_bytes" {
+    // Full round-trip: write config with field, reload, assert value preserved.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const config_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{base});
+    defer allocator.free(config_path);
+
+    var cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+    cfg.providers = &.{
+        .{ .name = "infini-ai", .api_key = "key", .max_streaming_prompt_bytes = 131072 },
+        .{ .name = "openai", .api_key = "sk-test" },
+    };
+    try cfg.save();
+
+    const file = try std.fs.openFileAbsolute(config_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(allocator, 64 * 1024);
+    defer allocator.free(content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var loaded = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = arena.allocator(),
+    };
+    try loaded.parseJson(content);
+
+    // Provider with field set → value survives round-trip.
+    try std.testing.expectEqual(@as(?usize, 131072), loaded.getProviderMaxStreamingPromptBytes("infini-ai"));
+    // Provider without field → null survives round-trip.
+    try std.testing.expectEqual(@as(?usize, null), loaded.getProviderMaxStreamingPromptBytes("openai"));
+}
+
 test "save encrypts persisted api keys and parse decrypts them" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4628,6 +4821,33 @@ test "providers defaults to empty" {
     try std.testing.expectEqual(@as(usize, 0), cfg.providers.len);
 }
 
+test "getProviderMaxStreamingPromptBytes: null when not set and when provider missing" {
+    const entries = [_]ProviderEntry{
+        .{
+            .name = "infini-ai",
+            .api_key = "key",
+            // max_streaming_prompt_bytes not set — should default to null
+        },
+        .{
+            .name = "groq",
+            .api_key = "key",
+            .max_streaming_prompt_bytes = 524288,
+        },
+    };
+    const cfg = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .providers = &entries,
+        .allocator = std.testing.allocator,
+    };
+    // Provider with no field set returns null.
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("infini-ai"));
+    // Provider with field set returns the configured value.
+    try std.testing.expectEqual(@as(?usize, 524288), cfg.getProviderMaxStreamingPromptBytes("groq"));
+    // Unknown provider returns null.
+    try std.testing.expectEqual(@as(?usize, null), cfg.getProviderMaxStreamingPromptBytes("unknown"));
+}
+
 test "audio_media defaults" {
     const cfg = Config{
         .workspace_dir = "/tmp/yc",
@@ -4659,6 +4879,18 @@ test "defaultProviderKey returns key for default provider" {
         if (e.user_agent) |ua| allocator.free(ua);
     }
     allocator.free(cfg.providers);
+}
+
+test "defaultProviderKey stays null when provider entry omits api key" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+    const json =
+        \\{"agents":{"defaults":{"model":{"primary":"openrouter/anthropic/claude-sonnet-4"}}},"models":{"providers":{"openrouter":{}}}}
+    ;
+    var cfg = Config{ .workspace_dir = "/tmp/yc", .config_path = "/tmp/yc/config.json", .allocator = allocator };
+    try cfg.parseJson(json);
+    try std.testing.expect(cfg.defaultProviderKey() == null);
 }
 
 test "tools.media.audio with language only parses correctly" {

@@ -1,5 +1,6 @@
 const std = @import("std");
 const Atomic = @import("portable_atomic.zig").Atomic;
+const fs_compat = @import("fs_compat.zig");
 
 /// Events the observer can record.
 pub const ObserverEvent = union(enum) {
@@ -297,7 +298,7 @@ pub const FileObserver = struct {
 
         std.fs.makeDirAbsolute(parent) catch |err| switch (err) {
             error.PathAlreadyExists => {},
-            else => std.fs.cwd().makePath(parent) catch {},
+            else => fs_compat.makePath(parent) catch {},
         };
     }
 

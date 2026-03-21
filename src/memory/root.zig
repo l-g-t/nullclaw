@@ -10,6 +10,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const config_types = @import("../config_types.zig");
+const fs_compat = @import("../fs_compat.zig");
 const provider_api_key = @import("../providers/api_key.zig");
 const log = std.log.scoped(.memory);
 
@@ -2165,7 +2166,7 @@ test "initRuntime hygiene preserve enqueues vector sync when durable outbox is a
 
     const archive_path = try std.fs.path.join(std.testing.allocator, &.{ ws.path, "memory", "archive" });
     defer std.testing.allocator.free(archive_path);
-    try std.fs.cwd().makePath(archive_path);
+    try fs_compat.makePath(archive_path);
 
     var archive_dir = try std.fs.cwd().openDir(archive_path, .{});
     defer archive_dir.close();

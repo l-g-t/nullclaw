@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const config_types = @import("../config_types.zig");
 const fs_compat = @import("../fs_compat.zig");
+const identity_mod = @import("../identity.zig");
 const platform = @import("../platform.zig");
 const memory_root = @import("../memory/root.zig");
 const tools_mod = @import("../tools/root.zig");
@@ -198,9 +200,11 @@ pub const PromptContext = struct {
     workspace_dir: []const u8,
     model_name: []const u8,
     tools: []const Tool,
+    timezone: []const u8 = "UTC",
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
     bootstrap_provider: ?BootstrapProvider = null,
+    identity_config: ?config_types.IdentityConfig = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -209,56 +213,62 @@ pub fn workspacePromptFingerprint(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    identity_config: ?config_types.IdentityConfig,
 ) !u64 {
-    // When a bootstrap provider is available, delegate fingerprinting to it.
-    if (bootstrap_provider) |bp| {
-        return bp.fingerprint(allocator);
-    }
-
-    // Fallback: file-based fingerprinting.
     var hasher = std.hash.Fnv1a_64.init();
-    const tracked_files = [_][]const u8{
-        "AGENTS.md",
-        "SOUL.md",
-        "TOOLS.md",
-        "IDENTITY.md",
-        "USER.md",
-        "HEARTBEAT.md",
-        "BOOTSTRAP.md",
-        "MEMORY.md",
-        "memory.md",
-    };
 
-    for (tracked_files) |filename| {
-        hasher.update(filename);
-        hasher.update("\n");
+    // When a bootstrap provider is available, reuse its bootstrap-doc fingerprint.
+    if (bootstrap_provider) |bp| {
+        const provider_fingerprint = try bp.fingerprint(allocator);
+        hasher.update("provider");
+        hasher.update(std.mem.asBytes(&provider_fingerprint));
+    } else {
+        // Fallback: file-based fingerprinting.
+        const tracked_files = [_][]const u8{
+            "AGENTS.md",
+            "SOUL.md",
+            "TOOLS.md",
+            "IDENTITY.md",
+            "USER.md",
+            "HEARTBEAT.md",
+            "BOOTSTRAP.md",
+            "MEMORY.md",
+            "memory.md",
+        };
 
-        const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
-        if (opened == null) {
-            hasher.update("missing");
-            continue;
+        for (tracked_files) |filename| {
+            hasher.update(filename);
+            hasher.update("\n");
+
+            const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
+            if (opened == null) {
+                hasher.update("missing");
+                continue;
+            }
+
+            const guarded = opened.?;
+            defer deinitGuardedWorkspaceFile(allocator, guarded);
+
+            const stat = guarded.stat;
+            hasher.update("present");
+            hasher.update(guarded.canonical_path);
+
+            if (workspaceFileDeviceId(&guarded.file)) |device_id| {
+                hasher.update(std.mem.asBytes(&device_id));
+            } else {
+                hasher.update("nodev");
+            }
+
+            const inode_id = stat.inode;
+            const mtime_ns: i128 = stat.mtime;
+            const size_bytes: u64 = @intCast(stat.size);
+            hasher.update(std.mem.asBytes(&inode_id));
+            hasher.update(std.mem.asBytes(&mtime_ns));
+            hasher.update(std.mem.asBytes(&size_bytes));
         }
-
-        const guarded = opened.?;
-        defer deinitGuardedWorkspaceFile(allocator, guarded);
-
-        const stat = guarded.stat;
-        hasher.update("present");
-        hasher.update(guarded.canonical_path);
-
-        if (workspaceFileDeviceId(&guarded.file)) |device_id| {
-            hasher.update(std.mem.asBytes(&device_id));
-        } else {
-            hasher.update("nodev");
-        }
-
-        const inode_id = stat.inode;
-        const mtime_ns: i128 = stat.mtime;
-        const size_bytes: u64 = @intCast(stat.size);
-        hasher.update(std.mem.asBytes(&inode_id));
-        hasher.update(std.mem.asBytes(&mtime_ns));
-        hasher.update(std.mem.asBytes(&size_bytes));
     }
+
+    try updateAieosIdentityFingerprint(allocator, &hasher, workspace_dir, identity_config);
 
     return hasher.final();
 }
@@ -273,7 +283,7 @@ pub fn buildSystemPrompt(
     const w = buf.writer(allocator);
 
     // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider);
+    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider, ctx.identity_config);
 
     // Attachment marker conventions for channel delivery.
     try appendChannelAttachmentsSection(w);
@@ -393,7 +403,7 @@ pub fn buildSystemPrompt(
     try std.fmt.format(w, "## Workspace\n\nWorking directory: `{s}`\n\n", .{ctx.workspace_dir});
 
     // DateTime section
-    try appendDateTimeSection(w);
+    try appendDateTimeSection(w, ctx.timezone);
 
     // Runtime section
     try std.fmt.format(w, "## Runtime\n\nOS: {s} | Model: {s}\n\n", .{
@@ -412,6 +422,7 @@ fn buildIdentitySection(
     w: anytype,
     workspace_dir: []const u8,
     bootstrap_provider: ?BootstrapProvider,
+    identity_config: ?config_types.IdentityConfig,
 ) !void {
     var remaining_bootstrap_chars: usize = BOOTSTRAP_TOTAL_MAX_CHARS;
     var hit_total_bootstrap_limit = false;
@@ -421,6 +432,14 @@ fn buildIdentitySection(
     try w.writeAll("If AGENTS.md is present, follow its operational guidance (including startup routines and red-line constraints) unless higher-priority instructions override it.\n\n");
     try w.writeAll("If SOUL.md is present, embody its persona and tone. Avoid stiff, generic replies; follow its guidance unless higher-priority instructions override it.\n\n");
     try w.writeAll("TOOLS.md does not control tool availability; it is user guidance for how to use external tools.\n\n");
+    try injectAieosIdentitySection(
+        allocator,
+        w,
+        workspace_dir,
+        identity_config,
+        &remaining_bootstrap_chars,
+        &hit_total_bootstrap_limit,
+    );
 
     const identity_files = [_][]const u8{
         "AGENTS.md",
@@ -461,6 +480,104 @@ fn buildIdentitySection(
             .{BOOTSTRAP_TOTAL_MAX_CHARS},
         );
     }
+}
+
+fn injectAieosIdentitySection(
+    allocator: std.mem.Allocator,
+    w: anytype,
+    workspace_dir: []const u8,
+    identity_config: ?config_types.IdentityConfig,
+    remaining_bootstrap_chars: *usize,
+    hit_total_bootstrap_limit: *bool,
+) !void {
+    const cfg = identity_config orelse return;
+    if (!identity_mod.isAieosConfigured(cfg.format, cfg.aieos_path, cfg.aieos_inline)) return;
+
+    const json_content = if (cfg.aieos_inline) |inline_json|
+        inline_json
+    else if (cfg.aieos_path) |path|
+        try loadAieosJsonFromPath(allocator, workspace_dir, path)
+    else
+        return;
+    defer if (cfg.aieos_inline == null) allocator.free(json_content);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const arena_allocator = arena.allocator();
+
+    const parsed_identity = try identity_mod.parseAieosJson(arena_allocator, json_content);
+    const prompt_text = try identity_mod.aieosToSystemPrompt(allocator, &parsed_identity);
+    defer allocator.free(prompt_text);
+
+    try appendPromptSectionContent(
+        w,
+        "AIEOS Identity",
+        prompt_text,
+        remaining_bootstrap_chars,
+        hit_total_bootstrap_limit,
+    );
+}
+
+fn updateAieosIdentityFingerprint(
+    allocator: std.mem.Allocator,
+    hasher: *std.hash.Fnv1a_64,
+    workspace_dir: []const u8,
+    identity_config: ?config_types.IdentityConfig,
+) !void {
+    const cfg = identity_config orelse {
+        hasher.update("aieos:none");
+        return;
+    };
+
+    hasher.update("aieos:");
+    hasher.update(cfg.format);
+    hasher.update("\n");
+
+    if (!identity_mod.isAieosConfigured(cfg.format, cfg.aieos_path, cfg.aieos_inline)) {
+        hasher.update("disabled");
+        return;
+    }
+
+    if (cfg.aieos_inline) |inline_json| {
+        hasher.update("inline\n");
+        hasher.update(inline_json);
+        return;
+    }
+
+    if (cfg.aieos_path) |path| {
+        hasher.update("path\n");
+        hasher.update(path);
+        hasher.update("\n");
+
+        const json_content = loadAieosJsonFromPath(allocator, workspace_dir, path) catch |err| {
+            hasher.update(@errorName(err));
+            return;
+        };
+        defer allocator.free(json_content);
+
+        hasher.update(json_content);
+        return;
+    }
+
+    hasher.update("missing-source");
+}
+
+fn loadAieosJsonFromPath(
+    allocator: std.mem.Allocator,
+    workspace_dir: []const u8,
+    identity_path: []const u8,
+) ![]u8 {
+    if (std.fs.path.isAbsolute(identity_path)) {
+        return std.fs.cwd().readFileAlloc(allocator, identity_path, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES);
+    }
+
+    const workspace_relative = try std.fs.path.join(allocator, &.{ workspace_dir, identity_path });
+    defer allocator.free(workspace_relative);
+
+    return std.fs.cwd().readFileAlloc(allocator, workspace_relative, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES) catch |workspace_err| switch (workspace_err) {
+        error.FileNotFound => std.fs.cwd().readFileAlloc(allocator, identity_path, MAX_WORKSPACE_BOOTSTRAP_FILE_BYTES),
+        else => workspace_err,
+    };
 }
 
 test "buildSystemPrompt includes SOUL persona guidance" {
@@ -521,6 +638,82 @@ test "buildSystemPrompt includes TOOLS availability guidance" {
     defer allocator.free(prompt);
 
     try std.testing.expect(std.mem.indexOf(u8, prompt, "TOOLS.md does not control tool availability; it is user guidance for how to use external tools.") != null);
+}
+
+test "buildSystemPrompt injects AIEOS identity from inline config" {
+    const allocator = std.testing.allocator;
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_inline = "{\"identity\":{\"names\":{\"first\":\"Nova\"},\"bio\":\"Helpful.\"},\"linguistics\":{\"style\":\"concise\"}}",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** Nova") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Bio:** Helpful.") != null);
+}
+
+test "buildSystemPrompt injects AIEOS identity from workspace-relative path" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("identity");
+    try tmp.dir.writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Path Nova\"}},\"motivations\":{\"core_drive\":\"Help\"}}",
+    });
+
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = workspace,
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_path = "identity/aieos.identity.json",
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Name:** Path Nova") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "**Core Drive:** Help") != null);
+}
+
+test "buildSystemPrompt applies bootstrap truncation to AIEOS identity" {
+    const allocator = std.testing.allocator;
+
+    const long_bio = try allocator.alloc(u8, BOOTSTRAP_MAX_CHARS + 512);
+    defer allocator.free(long_bio);
+    @memset(long_bio, 'A');
+
+    const inline_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"identity\":{{\"names\":{{\"first\":\"Nova\"}},\"bio\":\"{s}\"}}}}",
+        .{long_bio},
+    );
+    defer allocator.free(inline_json);
+
+    const prompt = try buildSystemPrompt(allocator, .{
+        .workspace_dir = "/tmp/nonexistent",
+        .model_name = "test-model",
+        .tools = &.{},
+        .identity_config = .{
+            .format = "aieos",
+            .aieos_inline = inline_json,
+        },
+    });
+    defer allocator.free(prompt);
+
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "### AIEOS Identity") != null);
+    try std.testing.expect(std.mem.indexOf(u8, prompt, "[... truncated at 20000 chars -- use `read` for full file]") != null);
 }
 
 test "buildSystemPrompt blocks AGENTS symlink escape outside workspace" {
@@ -594,6 +787,8 @@ fn writeToolInstructionsSection(w: anytype, tools: anytype) !void {
     try w.writeAll("After tool execution, results appear in <tool_result> tags. ");
     try w.writeAll("Continue reasoning with the results until you can give a final answer.\n\n");
     try w.writeAll("Prefer memory tools (memory_recall, memory_list, memory_store, memory_forget) for assistant memory tasks instead of shell/sqlite commands.\n\n");
+    try w.writeAll("If the user asks you to remember something across sessions, use `memory_store` before claiming it was saved.\n");
+    try w.writeAll("Do not promise persistent recall unless the memory tool succeeded. If storage fails or is unavailable, say so plainly.\n\n");
     try w.writeAll("### Available Tools\n\n");
 
     for (tools) |t| {
@@ -612,6 +807,16 @@ pub fn buildToolInstructions(allocator: std.mem.Allocator, tools: anytype) ![]co
     errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
     try writeToolInstructionsSection(w, tools);
+    return try buf.toOwnedSlice(allocator);
+}
+
+/// Allocating wrapper around appendSkillsSection for callers that need
+/// skill guidance as a standalone string (e.g. subagent runner).
+pub fn buildSkillsSection(allocator: std.mem.Allocator, workspace_dir: []const u8) ![]const u8 {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try appendSkillsSection(allocator, w, workspace_dir);
     return try buf.toOwnedSlice(allocator);
 }
 
@@ -742,10 +947,18 @@ fn appendSkillsSection(
     }
 }
 
-/// Append a human-readable UTC date/time section derived from the system clock.
-fn appendDateTimeSection(w: anytype) !void {
-    const timestamp = std.time.timestamp();
-    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = @intCast(timestamp) };
+/// Append a human-readable date/time section using configured timezone.
+/// Supported timezone values:
+/// - "UTC" (default)
+/// - fixed offsets in format "UTC+HH:MM" or "UTC-HH:MM"
+fn appendDateTimeSection(w: anytype, timezone: []const u8) !void {
+    const offset_secs_opt = config_types.AgentConfig.parseTimezoneOffsetSeconds(timezone);
+    const offset_secs = offset_secs_opt orelse 0;
+    const adjusted_ts: i64 = std.time.timestamp() + offset_secs;
+    const safe_ts: u64 = if (adjusted_ts < 0) 0 else @intCast(adjusted_ts);
+
+    const tz_label = if (offset_secs_opt != null) timezone else "UTC";
+    const epoch_seconds = std.time.epoch.EpochSeconds{ .secs = safe_ts };
     const epoch_day = epoch_seconds.getEpochDay();
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
@@ -757,8 +970,8 @@ fn appendDateTimeSection(w: anytype) !void {
     const hour = day_seconds.getHoursIntoDay();
     const minute = day_seconds.getMinutesIntoHour();
 
-    try std.fmt.format(w, "## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} UTC\n\n", .{
-        year, month, day, hour, minute,
+    try std.fmt.format(w, "## Current Date & Time\n\n{d}-{d:0>2}-{d:0>2} {d:0>2}:{d:0>2} {s}\n\n", .{
+        year, month, day, hour, minute, tz_label,
     });
 }
 
@@ -1277,6 +1490,7 @@ test "buildSystemPrompt project context stays equivalent across markdown hybrid 
             std.testing.allocator,
             workspace,
             bootstrap_provider,
+            null,
         );
         if (expected_fingerprint) |value| {
             try std.testing.expectEqual(value, fingerprint);
@@ -1543,8 +1757,8 @@ test "workspacePromptFingerprint is stable when files are unchanged" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
-    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
+    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expectEqual(fp1, fp2);
 }
 
@@ -1561,7 +1775,7 @@ test "workspacePromptFingerprint changes when tracked file changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
@@ -1569,7 +1783,7 @@ test "workspacePromptFingerprint changes when tracked file changes" {
         try f.writeAll("longer-content-after-change");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1586,7 +1800,7 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("MEMORY.md", .{ .truncate = true });
@@ -1594,7 +1808,7 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
         try f.writeAll("memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1611,7 +1825,7 @@ test "workspacePromptFingerprint changes when memory.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("memory.md", .{ .truncate = true });
@@ -1619,7 +1833,7 @@ test "workspacePromptFingerprint changes when memory.md changes" {
         try f.writeAll("alt-memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1636,7 +1850,7 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("BOOTSTRAP.md", .{ .truncate = true });
@@ -1644,7 +1858,7 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
         try f.writeAll("bootstrap-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1661,7 +1875,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("HEARTBEAT.md", .{ .truncate = true });
@@ -1669,7 +1883,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
         try f.writeAll("- check-2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1686,7 +1900,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
@@ -1694,7 +1908,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1711,7 +1925,7 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("AGENTS.md", .{ .truncate = true });
@@ -1719,7 +1933,7 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
         try f.writeAll("startup-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
     try std.testing.expect(before != after);
 }
 
@@ -1736,7 +1950,7 @@ test "workspacePromptFingerprint changes when USER.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
 
     {
         const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
@@ -1744,7 +1958,35 @@ test "workspacePromptFingerprint changes when USER.md changes" {
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, null);
+    try std.testing.expect(before != after);
+}
+
+test "workspacePromptFingerprint changes when configured AIEOS path changes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("identity");
+    try tmp.dir.writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Nova V1\"}}}",
+    });
+
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    const identity_config: config_types.IdentityConfig = .{
+        .format = "aieos",
+        .aieos_path = "identity/aieos.identity.json",
+    };
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null, identity_config);
+
+    try tmp.dir.writeFile(.{
+        .sub_path = "identity/aieos.identity.json",
+        .data = "{\"identity\":{\"names\":{\"first\":\"Nova V2\"}}}",
+    });
+
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null, identity_config);
     try std.testing.expect(before != after);
 }
 
@@ -1793,8 +2035,7 @@ test "appendDateTimeSection outputs UTC timestamp" {
     var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(std.testing.allocator);
     const w = buf.writer(std.testing.allocator);
-    try appendDateTimeSection(w);
-
+    try appendDateTimeSection(w, "UTC");
     const output = buf.items;
     try std.testing.expect(std.mem.indexOf(u8, output, "## Current Date & Time") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "UTC") != null);
@@ -1802,6 +2043,22 @@ test "appendDateTimeSection outputs UTC timestamp" {
     try std.testing.expect(std.mem.indexOf(u8, output, "202") != null);
 }
 
+test "appendDateTimeSection supports fixed UTC offset" {
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    const w = buf.writer(std.testing.allocator);
+    try appendDateTimeSection(w, "UTC+08:00");
+    const output = buf.items;
+    try std.testing.expect(std.mem.indexOf(u8, output, "UTC+08:00") != null);
+}
+
+test "parseUtcOffsetSeconds validates supported formats" {
+    try std.testing.expectEqual(@as(?i64, 0), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC"));
+    try std.testing.expectEqual(@as(?i64, 5 * 3600 + 30 * 60), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC+05:30"));
+    try std.testing.expectEqual(@as(?i64, -(3 * 3600)), config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC-03:00"));
+    try std.testing.expect(config_types.AgentConfig.parseTimezoneOffsetSeconds("Asia/Shanghai") == null);
+    try std.testing.expect(config_types.AgentConfig.parseTimezoneOffsetSeconds("UTC+25:00") == null);
+}
 test "appendSkillsSection with no skills produces nothing" {
     const allocator = std.testing.allocator;
     var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -1810,6 +2067,13 @@ test "appendSkillsSection with no skills produces nothing" {
     try appendSkillsSection(allocator, w, "/tmp/nullclaw-prompt-test-no-skills");
 
     try std.testing.expectEqual(@as(usize, 0), buf.items.len);
+}
+
+test "buildSkillsSection with no skills returns empty" {
+    const allocator = std.testing.allocator;
+    const content = try buildSkillsSection(allocator, "/tmp/nullclaw-prompt-test-no-skills-wrapper");
+    defer allocator.free(content);
+    try std.testing.expectEqual(@as(usize, 0), content.len);
 }
 
 test "appendSkillsSection renders summary XML for always=false skill" {

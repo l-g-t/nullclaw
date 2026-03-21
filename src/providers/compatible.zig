@@ -12,7 +12,10 @@ const ToolCall = root.ToolCall;
 const TokenUsage = root.TokenUsage;
 
 const log = std.log.scoped(.compatible);
-const MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
+/// Legacy default kept as a named constant for tests only.
+/// Runtime code uses OpenAiCompatibleProvider.max_streaming_prompt_bytes (null = no limit).
+const DEFAULT_MAX_STREAMING_PROMPT_BYTES: usize = 32 * 1024;
+const STREAMING_FALLBACK_TIMEOUT_SECS: u64 = 90;
 
 fn logCompatibleApiError(
     allocator: std.mem.Allocator,
@@ -173,8 +176,8 @@ pub const OpenAiCompatibleProvider = struct {
     /// When set, cap max_tokens in non-streaming requests to this value.
     /// Some providers (e.g. Fireworks) reject large max_tokens without streaming.
     max_tokens_non_streaming: ?u32 = null,
-    /// When true, include `"thinking":{"type":"enabled"}` in request bodies
-    /// when reasoning_effort is set. Required by Z.AI/GLM thinking models.
+    /// When true, include `"thinking":{"type":"enabled|disabled"}` in request
+    /// bodies so Z.AI/GLM models do not fall back to server-side defaults.
     thinking_param: bool = false,
     /// When true, include `"enable_thinking":true` in request bodies
     /// when reasoning_effort is set. Required by Qwen (DashScope compatible mode).
@@ -185,6 +188,10 @@ pub const OpenAiCompatibleProvider = struct {
     /// Optional User-Agent header for HTTP requests.
     /// When set, requests will include "User-Agent: {value}" header.
     user_agent: ?[]const u8 = null,
+    /// Maximum estimated request text bytes before streaming is skipped.
+    /// null means no limit — streaming is always attempted.
+    /// Set via per-provider config field `max_streaming_prompt_bytes`.
+    max_streaming_prompt_bytes: ?usize = null,
     allocator: std.mem.Allocator,
 
     const think_open_tag = "<think>";
@@ -303,6 +310,21 @@ pub const OpenAiCompatibleProvider = struct {
             }
         }
         return total;
+    }
+
+    /// Returns true when the streaming path should be skipped in favour of the
+    /// non-streaming fallback.  When `limit` is null (the default) this always
+    /// returns false — i.e. always attempt streaming regardless of payload size.
+    pub fn shouldSkipStreaming(limit: ?usize, request: ChatRequest) bool {
+        const l = limit orelse return false;
+        return estimateRequestTextBytes(request) >= l;
+    }
+
+    fn streamingFallbackTimeoutSecs(request_timeout_secs: u64) u64 {
+        if (request_timeout_secs > 0 and request_timeout_secs < STREAMING_FALLBACK_TIMEOUT_SECS) {
+            return request_timeout_secs;
+        }
+        return STREAMING_FALLBACK_TIMEOUT_SECS;
     }
 
     /// Build a Responses API request JSON body.
@@ -590,6 +612,44 @@ pub const OpenAiCompatibleProvider = struct {
         ctx.state.feed(chunk.delta, ctx.downstream, ctx.downstream_ctx);
     }
 
+    fn extractMessageText(allocator: std.mem.Allocator, msg_obj: std.json.ObjectMap) !?[]const u8 {
+        const content = msg_obj.get("content") orelse return null;
+
+        switch (content) {
+            .string => {
+                const trimmed = std.mem.trim(u8, content.string, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try allocator.dupe(u8, trimmed);
+            },
+            .array => {
+                var text_parts: std.ArrayListUnmanaged(u8) = .empty;
+                defer text_parts.deinit(allocator);
+
+                for (content.array.items) |part| {
+                    var candidate: ?[]const u8 = null;
+                    switch (part) {
+                        .string => candidate = part.string,
+                        .object => {
+                            if (part.object.get("text")) |text| {
+                                if (text == .string) candidate = text.string;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (candidate) |text_value| {
+                        try text_parts.appendSlice(allocator, text_value);
+                    }
+                }
+
+                const trimmed = std.mem.trim(u8, text_parts.items, " \t\n\r");
+                if (trimmed.len == 0) return null;
+                return try allocator.dupe(u8, trimmed);
+            },
+            else => return null,
+        }
+    }
+
     /// Parse text content from an OpenAI-compatible response.
     pub fn parseTextResponse(allocator: std.mem.Allocator, body: []const u8) ![]const u8 {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});
@@ -609,10 +669,11 @@ pub const OpenAiCompatibleProvider = struct {
         if (root_obj.get("choices")) |choices| {
             if (choices.array.items.len > 0) {
                 if (choices.array.items[0].object.get("message")) |msg| {
-                    if (msg.object.get("content")) |content| {
-                        if (content == .string) {
-                            return stripThinkBlocks(allocator, content.string);
-                        }
+                    const msg_obj = msg.object;
+
+                    if (try extractMessageText(allocator, msg_obj)) |text| {
+                        defer allocator.free(text);
+                        return stripThinkBlocks(allocator, text);
                     }
                 }
             }
@@ -643,13 +704,14 @@ pub const OpenAiCompatibleProvider = struct {
                 const msg_obj = msg.object;
 
                 var content: ?[]const u8 = null;
+                errdefer if (content) |c| if (c.len > 0) allocator.free(c);
                 var reasoning_content: ?[]const u8 = null;
-                if (msg_obj.get("content")) |c| {
-                    if (c == .string) {
-                        const split = try splitThinkContent(allocator, c.string);
-                        content = split.visible;
-                        reasoning_content = split.reasoning;
-                    }
+                errdefer if (reasoning_content) |rc| if (rc.len > 0) allocator.free(rc);
+                if (try extractMessageText(allocator, msg_obj)) |message_text| {
+                    defer allocator.free(message_text);
+                    const split = try splitThinkContent(allocator, message_text);
+                    content = split.visible;
+                    reasoning_content = split.reasoning;
                 }
                 // Fallback: some providers return reasoning in native fields.
                 // - Z.AI/GLM: `reasoning_content`
@@ -668,6 +730,14 @@ pub const OpenAiCompatibleProvider = struct {
                 }
 
                 var tool_calls_list: std.ArrayListUnmanaged(ToolCall) = .empty;
+                errdefer {
+                    for (tool_calls_list.items) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    tool_calls_list.deinit(allocator);
+                }
 
                 if (msg_obj.get("tool_calls")) |tc_arr| {
                     for (tc_arr.array.items) |tc| {
@@ -688,6 +758,19 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
 
+                // Treat a response with no content, no tool calls, and no reasoning as empty.
+                // This happens when the model hits its context limit and returns finish_reason=length
+                // with a null or empty content field. Returning NoResponseContent here lets the
+                // agent's empty-response retry and model-fallback logic engage rather than
+                // silently succeeding with nothing to show.
+                const has_content = content != null and content.?.len > 0;
+                const has_tools = tool_calls_list.items.len > 0;
+                const has_reasoning = reasoning_content != null and reasoning_content.?.len > 0;
+                if (!has_content and !has_tools and !has_reasoning) {
+                    log.warn("parseNativeResponse: response has no content, tool calls, or reasoning; treating as NoResponseContent", .{});
+                    return error.NoResponseContent;
+                }
+
                 var usage = TokenUsage{};
                 if (root_obj.get("usage")) |usage_obj| {
                     if (usage_obj == .object) {
@@ -703,11 +786,22 @@ pub const OpenAiCompatibleProvider = struct {
                     }
                 }
 
+                const owned_tool_calls = try tool_calls_list.toOwnedSlice(allocator);
+                errdefer {
+                    for (owned_tool_calls) |tc| {
+                        if (tc.id.len > 0) allocator.free(tc.id);
+                        if (tc.name.len > 0) allocator.free(tc.name);
+                        if (tc.arguments.len > 0) allocator.free(tc.arguments);
+                    }
+                    if (owned_tool_calls.len > 0) allocator.free(owned_tool_calls);
+                }
+
                 const model_str = if (root_obj.get("model")) |m| (if (m == .string) try allocator.dupe(u8, m.string) else try allocator.dupe(u8, "")) else try allocator.dupe(u8, "");
+                errdefer if (model_str.len > 0) allocator.free(model_str);
 
                 return .{
                     .content = content,
-                    .tool_calls = try tool_calls_list.toOwnedSlice(allocator),
+                    .tool_calls = owned_tool_calls,
                     .usage = usage,
                     .model = model_str,
                     .reasoning_content = reasoning_content,
@@ -749,12 +843,12 @@ pub const OpenAiCompatibleProvider = struct {
     ) anyerror!root.StreamChatResult {
         const self: *OpenAiCompatibleProvider = @ptrCast(@alignCast(ptr));
         const effective_model = self.normalizeProviderModel(model);
-        const request_text_bytes = estimateRequestTextBytes(request);
 
-        if (request_text_bytes >= MAX_STREAMING_PROMPT_BYTES) {
+        if (shouldSkipStreaming(self.max_streaming_prompt_bytes, request)) {
+            const request_text_bytes = estimateRequestTextBytes(request);
             log.warn(
                 "{s} streaming skipped for large request ({d} bytes >= {d}); using non-streaming",
-                .{ self.name, request_text_bytes, MAX_STREAMING_PROMPT_BYTES },
+                .{ self.name, request_text_bytes, self.max_streaming_prompt_bytes.? },
             );
             const fallback = try chatImpl(ptr, allocator, request, model, temperature);
             if (fallback.content) |text| {
@@ -823,7 +917,12 @@ pub const OpenAiCompatibleProvider = struct {
         ) catch |err| {
             if (err == error.CurlWaitError or err == error.CurlFailed) {
                 log.warn("{s} streaming failed with {}; falling back to non-streaming response", .{ self.name, err });
-                var fallback = try chatImpl(ptr, allocator, request, model, temperature);
+                // Cap the fallback timeout to 90 s — if streaming stalled (e.g. speed-limit
+                // triggered after 60 s of zero throughput) the non-streaming endpoint is
+                // likely slow too; avoid blocking for the full message_timeout_secs.
+                var fallback_request = request;
+                fallback_request.timeout_secs = streamingFallbackTimeoutSecs(request.timeout_secs);
+                var fallback = try chatImpl(ptr, allocator, fallback_request, model, temperature);
                 return root.emitChatResponseAsStream(allocator, &fallback, callback, callback_ctx);
             }
             return err;
@@ -1321,6 +1420,96 @@ test "parseNativeResponse reads native reasoning field (Groq/Cerebras parsed for
     try std.testing.expectEqualStrings("parsed reasoning trace", result.reasoning_content.?);
 }
 
+test "parseNativeResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}],"model":"kimi-k2.5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content != null);
+    try std.testing.expectEqualStrings("Hello from kimi-k2.5", result.content.?);
+    try std.testing.expect(result.reasoning_content == null);
+}
+
+test "parseNativeResponse null content with no tools or reasoning returns NoResponseContent" {
+    // Simulates GLM-5 hitting its context limit: finish_reason=length, content=null.
+    // All three payloads (content, tool_calls, reasoning_content) are absent/empty.
+    // parseNativeResponse must return NoResponseContent so the agent's retry/fallback chain engages.
+    const body =
+        \\{"choices":[{"message":{"content":null},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse empty string content with no tools or reasoning returns NoResponseContent" {
+    const body =
+        \\{"choices":[{"message":{"content":""},"finish_reason":"length"}],"model":"glm-5"}
+    ;
+    try std.testing.expectError(
+        error.NoResponseContent,
+        OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body),
+    );
+}
+
+test "parseNativeResponse null content with reasoning_content succeeds" {
+    // Reasoning-only response (thinking model that produced a CoT but no final text) is valid.
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"step-by-step reasoning here"}}],"model":"glm-z1"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.reasoning_content != null);
+    try std.testing.expectEqualStrings("step-by-step reasoning here", result.reasoning_content.?);
+}
+
+test "parseNativeResponse null content with native tool calls succeeds" {
+    // Models that emit tool_calls with no text content are valid — the agent should
+    // execute the tool, not treat the response as empty.
+    const body =
+        \\{"choices":[{"message":{"content":null,"tool_calls":[{"id":"call-1","function":{"name":"list_dir","arguments":"{\"path\":\"/tmp\"}"}}]}}],"model":"glm-5"}
+    ;
+    const result = try OpenAiCompatibleProvider.parseNativeResponse(std.testing.allocator, body);
+    defer {
+        if (result.content) |c| if (c.len > 0) std.testing.allocator.free(c);
+        for (result.tool_calls) |tc| {
+            if (tc.id.len > 0) std.testing.allocator.free(tc.id);
+            if (tc.name.len > 0) std.testing.allocator.free(tc.name);
+            if (tc.arguments.len > 0) std.testing.allocator.free(tc.arguments);
+        }
+        if (result.tool_calls.len > 0) std.testing.allocator.free(result.tool_calls);
+        if (result.model.len > 0) std.testing.allocator.free(result.model);
+        if (result.reasoning_content) |rc| if (rc.len > 0) std.testing.allocator.free(rc);
+    }
+    try std.testing.expect(result.content == null);
+    try std.testing.expect(result.tool_calls.len == 1);
+    try std.testing.expectEqualStrings("list_dir", result.tool_calls[0].name);
+    try std.testing.expectEqualStrings("call-1", result.tool_calls[0].id);
+}
+
 test "buildChatRequestBody emits thinking param for GLM when reasoning_effort set" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
@@ -1373,16 +1562,16 @@ test "buildChatRequestBody emits reasoning_split when configured" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") != null);
 }
 
-test "buildChatRequestBody sends thinking disabled when reasoning_effort none" {
+test "buildChatRequestBody sends thinking disabled when reasoning_effort unset" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("test")};
     const req = root.ChatRequest{
         .messages = &msgs,
         .model = "glm-4.7-thinking",
-        .reasoning_effort = "none",
     };
     const body = try buildChatRequestBody(allocator, req, "glm-4.7-thinking", 0.7, false, true, true, true);
     defer allocator.free(body);
+    // Regression: GLM defaults deep thinking to enabled unless we explicitly send disabled.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
@@ -1548,6 +1737,22 @@ test "parseTextResponse with null content fails" {
     try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
 }
 
+test "parseTextResponse does not surface reasoning_content as visible content" {
+    const body =
+        \\{"choices":[{"message":{"content":null,"reasoning_content":"private chain of thought"}}]}
+    ;
+    try std.testing.expectError(error.NoResponseContent, OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body));
+}
+
+test "parseTextResponse supports content array text parts" {
+    const body =
+        \\{"choices":[{"message":{"content":[{"type":"text","text":"Hello "},{"type":"text","text":"from kimi-k2.5"}]}}]}
+    ;
+    const result = try OpenAiCompatibleProvider.parseTextResponse(std.testing.allocator, body);
+    defer std.testing.allocator.free(result);
+    try std.testing.expectEqualStrings("Hello from kimi-k2.5", result);
+}
+
 test "AuthStyle headerName" {
     try std.testing.expectEqualStrings("authorization", AuthStyle.bearer.headerName());
     try std.testing.expectEqualStrings("x-api-key", AuthStyle.x_api_key.headerName());
@@ -1607,6 +1812,14 @@ test "capNonStreamingMaxTokens leaves request unchanged when limit is unset" {
 
     const capped = p.capNonStreamingMaxTokens(req);
     try std.testing.expectEqual(@as(?u32, 8000), capped.max_tokens);
+}
+
+test "streamingFallbackTimeoutSecs caps stalled-stream fallback timeout" {
+    // Regression: a provider that stalls on both streaming and non-streaming
+    // paths must not consume the full message_timeout_secs twice.
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(0));
+    try std.testing.expectEqual(@as(u64, 45), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(45));
+    try std.testing.expectEqual(@as(u64, STREAMING_FALLBACK_TIMEOUT_SECS), OpenAiCompatibleProvider.streamingFallbackTimeoutSecs(300));
 }
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1794,25 +2007,32 @@ test "buildStreamingChatRequestBody contains stream true" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"include_usage\":true") != null);
 }
 
-test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effort none" {
+test "buildStreamingChatRequestBody sends thinking disabled when reasoning_effort unset" {
     const allocator = std.testing.allocator;
     const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
     const req = root.ChatRequest{
         .messages = &msgs,
         .model = "test-model",
-        .reasoning_effort = "none",
     };
     const body = try buildStreamingChatRequestBody(allocator, req, "test-model", 0.7, false, true, true, true);
     defer allocator.free(body);
+    // Regression: GLM defaults deep thinking to enabled unless we explicitly send disabled.
     try std.testing.expect(std.mem.indexOf(u8, body, "\"thinking\":{\"type\":\"disabled\"}") != null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"enable_thinking\":true") == null);
     try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_split\":true") == null);
 }
 
-test "supportsStreaming returns true for compatible" {
+test "supportsStreaming returns true for compatible by default" {
     var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsStreaming());
+}
+
+test "supportsStreaming returns false when disable_streaming enabled" {
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "glm", "https://api.z.ai/api/paas/v4", "key", .bearer, null);
+    p.disable_streaming = true;
+    const prov = p.provider();
+    try std.testing.expect(!prov.supportsStreaming());
 }
 
 test "validateUserAgent rejects CRLF injection" {
@@ -2147,4 +2367,165 @@ test "merge_system_into_user streaming body also merges" {
     try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
     const content = messages.items[0].object.get("content").?.string;
     try std.testing.expect(std.mem.indexOf(u8, content, "[System: Be concise]") != null);
+}
+
+test "max_streaming_prompt_bytes null means no limit" {
+    // A provider with no limit set should never skip to non-streaming regardless of payload size.
+    const prov = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://api.example.com/v1",
+        "key",
+        .bearer,
+        null,
+    );
+    // null = no limit
+    try std.testing.expectEqual(@as(?usize, null), prov.max_streaming_prompt_bytes);
+}
+
+test "max_streaming_prompt_bytes set applies threshold" {
+    // A provider with a limit set should reflect it.
+    var prov = OpenAiCompatibleProvider.init(
+        std.testing.allocator,
+        "test",
+        "https://api.example.com/v1",
+        "key",
+        .bearer,
+        null,
+    );
+    prov.max_streaming_prompt_bytes = 65536;
+    try std.testing.expectEqual(@as(?usize, 65536), prov.max_streaming_prompt_bytes);
+
+    // A small message should be under the limit; a large one should exceed it.
+    const small_msgs = [_]root.ChatMessage{root.ChatMessage.user("hi")};
+    const small_req = root.ChatRequest{ .messages = &small_msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.estimateRequestTextBytes(small_req) < 65536);
+
+    const big_content = "x" ** 70000;
+    const big_msgs = [_]root.ChatMessage{root.ChatMessage.user(big_content)};
+    const big_req = root.ChatRequest{ .messages = &big_msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.estimateRequestTextBytes(big_req) >= 65536);
+}
+
+test "DEFAULT_MAX_STREAMING_PROMPT_BYTES legacy value is 32 KiB" {
+    try std.testing.expectEqual(@as(usize, 32 * 1024), DEFAULT_MAX_STREAMING_PROMPT_BYTES);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// shouldSkipStreaming — behavioural branch tests
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldSkipStreaming: null limit never skips streaming" {
+    // Even a payload larger than the old 32 KiB hardcoded limit must NOT skip
+    // when max_streaming_prompt_bytes is null (the new default).
+    const big_content = "x" ** 70000; // 70 KiB > old 32 KiB limit
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(big_content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+test "shouldSkipStreaming: below limit does not skip" {
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("hello")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    // limit = 1 MiB, 5 bytes << 1 MiB
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(1024 * 1024, req));
+}
+
+test "shouldSkipStreaming: at limit skips" {
+    // Content of exactly `limit` bytes should trigger the fallback.
+    const content = "a" ** 100;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(100, req));
+}
+
+test "shouldSkipStreaming: above limit skips" {
+    const content = "a" ** 101;
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(100, req));
+}
+
+test "shouldSkipStreaming: old 32KiB limit would have skipped typical session with 50 MCP tools" {
+    // Regression: with the old hardcoded 32 KiB threshold a session loaded with
+    // 50 Vikunja tools (~46-48 KiB of text) always fell back to non-streaming.
+    // The new default (null) must never skip it.
+    const content = "x" ** 48000; // representative of typical session text estimate
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user(content)};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+
+    // Old hardcoded limit would have skipped.
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(DEFAULT_MAX_STREAMING_PROMPT_BYTES, req));
+    // New default (null) must not skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// estimateRequestTextBytes — edge cases (GAP-6, GAP-7, GAP-8)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "estimateRequestTextBytes: empty messages slice returns zero" {
+    // GAP-6: Must not crash on an empty slice and must return 0.
+    const req = root.ChatRequest{ .messages = &.{}, .model = "m" };
+    try std.testing.expectEqual(@as(usize, 0), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+test "estimateRequestTextBytes: counts content_parts text and ignores non-text" {
+    // GAP-7: Only text parts inside content_parts should be counted; image
+    // parts must not contribute to the byte total.
+    const text_part = root.ContentPart{ .text = "hello world" }; // 11 bytes
+    const image_part = root.ContentPart{ .image_url = .{ .url = "https://x.com/img.jpg", .detail = .auto } };
+    var parts = [_]root.ContentPart{ text_part, image_part };
+    const msg = root.ChatMessage{
+        .role = .user,
+        .content = "",
+        .content_parts = &parts,
+    };
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{msg}, .model = "m" };
+    // Only "hello world" (11 bytes) — not the image URL — is counted.
+    try std.testing.expectEqual(@as(usize, 11), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+test "estimateRequestTextBytes: accumulates across multiple messages" {
+    // GAP-8: Total must be the sum across all messages, not just the last.
+    const m1 = root.ChatMessage.user("aaa"); // 3 bytes
+    const m2 = root.ChatMessage.user("bbbb"); // 4 bytes
+    const m3 = root.ChatMessage.user("ccccc"); // 5 bytes
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{ m1, m2, m3 }, .model = "m" };
+    try std.testing.expectEqual(@as(usize, 12), OpenAiCompatibleProvider.estimateRequestTextBytes(req));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// shouldSkipStreaming — additional edge cases (GAP-9, GAP-10, GAP-11)
+// ════════════════════════════════════════════════════════════════════════════
+
+test "shouldSkipStreaming: zero limit skips any non-empty request" {
+    // GAP-9: A limit of 0 means every message (≥1 byte) should fall back.
+    const msgs = [_]root.ChatMessage{root.ChatMessage.user("x")};
+    const req = root.ChatRequest{ .messages = &msgs, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(0, req));
+}
+
+test "shouldSkipStreaming: empty request never skips regardless of limit" {
+    // GAP-10: Zero-byte payload is always below any limit (including 0 is
+    // 0 >= 0 = true — but an empty messages slice returns 0 bytes, and 0 >= 0
+    // means a zero limit would still skip an empty request; document actual behaviour).
+    const req = root.ChatRequest{ .messages = &.{}, .model = "m" };
+    // With a non-zero limit: 0 bytes < limit → no skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(1, req));
+    // With null: always no skip.
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(null, req));
+}
+
+test "shouldSkipStreaming: multi-message total triggers skip when sum exceeds limit" {
+    // GAP-11: Threshold must apply to the accumulated total, not per-message.
+    // Three messages of 10 bytes each = 30 bytes total; limit = 25.
+    const m1 = root.ChatMessage.user("aaaaaaaaaa"); // 10
+    const m2 = root.ChatMessage.user("bbbbbbbbbb"); // 10
+    const m3 = root.ChatMessage.user("cccccccccc"); // 10 → total 30
+    const req = root.ChatRequest{ .messages = &[_]root.ChatMessage{ m1, m2, m3 }, .model = "m" };
+    try std.testing.expect(OpenAiCompatibleProvider.shouldSkipStreaming(25, req));
+    // Individual messages are each under the limit; verify the sum is what matters.
+    const single = root.ChatRequest{ .messages = &[_]root.ChatMessage{m1}, .model = "m" };
+    try std.testing.expect(!OpenAiCompatibleProvider.shouldSkipStreaming(25, single));
 }
