@@ -785,6 +785,11 @@ pub const Agent = struct {
         var records = std.ArrayList(struct { role: providers.Role, content: []u8 }).empty;
         defer records.deinit(self.allocator);
 
+        var skipped_session_mismatch: usize = 0;
+        var skipped_system: usize = 0;
+        var skipped_parse: usize = 0;
+        var skipped_other: usize = 0;
+
         // Iterate from newest to oldest
         var i = files.items.len;
         while (i > 0) {
@@ -794,42 +799,54 @@ pub const Agent = struct {
 
             var file = std.fs.openFileAbsolute(file_path, .{ .mode = .read_only }) catch |err| {
                 log.warn("Warm start: failed to open message file '{s}': {s}", .{ file_path, @errorName(err) });
+                skipped_other += 1;
                 continue;
             };
             defer file.close();
 
             const file_stat = fs_compat.stat(file) catch |err| {
                 log.warn("Warm start: failed to stat message file '{s}': {s}", .{ file_path, @errorName(err) });
+                skipped_other += 1;
                 continue;
             };
             const file_size = file_stat.size;
 
             var file_buf = self.allocator.alloc(u8, file_size) catch |err| {
                 log.warn("Warm start: allocation failed for file buffer (size {d}): {s}", .{ file_size, @errorName(err) });
+                skipped_other += 1;
                 continue;
             };
             defer self.allocator.free(file_buf);
 
             const read_len = file.readAll(file_buf) catch |err| {
                 log.warn("Warm start: failed to read file '{s}': {s}", .{ file_path, @errorName(err) });
+                skipped_other += 1;
                 continue;
             };
             if (read_len < file_size) {
                 log.warn("Warm start: incomplete read of file '{s}': expected {d}, got {d}", .{ file_path, file_size, read_len });
+                skipped_other += 1;
                 continue;
             }
 
             const parsed = self.parseMessageFile(file_buf[0..read_len]) catch |err| {
                 log.warn("Warm start: parse error in file '{s}': {s}", .{ file_path, @errorName(err) });
+                skipped_parse += 1;
                 continue;
             };
 
             // Skip system messages
-            if (parsed.role == .system) continue;
+            if (parsed.role == .system) {
+                skipped_system += 1;
+                continue;
+            }
 
-            // Enforce session ID match if configured
+            // Enforce session ID match if configured: only skip if the message
+            // has a non-null session_id that doesn't match the current session.
+            // Messages with null session_id (legacy logs) are always included.
             if (self.memory_session_id != null) {
-                if (parsed.session_id == null or !std.mem.eql(u8, parsed.session_id.?, self.memory_session_id.?)) {
+                if (parsed.session_id != null and !std.mem.eql(u8, parsed.session_id.?, self.memory_session_id.?)) {
+                    skipped_session_mismatch += 1;
                     continue;
                 }
             }
@@ -837,18 +854,20 @@ pub const Agent = struct {
             // Duplicate content for history
             const owned_content = self.allocator.dupe(u8, parsed.content) catch |err| {
                 log.warn("Warm start: allocation failed for content: {s}", .{@errorName(err)});
+                skipped_other += 1;
                 continue;
             };
 
             records.append(self.allocator, .{ .role = parsed.role, .content = owned_content }) catch |err| {
                 self.allocator.free(owned_content);
                 log.warn("Warm start: failed to append record: {s}", .{@errorName(err)});
+                skipped_other += 1;
                 continue;
             };
         }
 
         if (records.items.len == 0) {
-            log.info("Warm start: no valid messages loaded (all skipped)", .{});
+            log.info("Warm start: no valid messages loaded (skipped: system={d}, parse={d}, session_mismatch={d}, other={d})", .{ skipped_system, skipped_parse, skipped_session_mismatch, skipped_other });
             return;
         }
 
