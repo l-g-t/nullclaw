@@ -1,6 +1,8 @@
 const std = @import("std");
 const zig_builtin = @import("builtin");
 const fs_compat = @import("fs_compat.zig");
+const http_util = @import("http_util.zig");
+const net_security = @import("net_security.zig");
 const platform = @import("platform.zig");
 const json_miniparse = @import("json_miniparse.zig");
 
@@ -828,6 +830,67 @@ fn isGitScpSource(source: []const u8) bool {
     return true;
 }
 
+fn isHttpSource(source: []const u8) bool {
+    return std.mem.startsWith(u8, source, "https://") or std.mem.startsWith(u8, source, "http://");
+}
+
+fn buildWellKnownSkillUrls(allocator: std.mem.Allocator, source: []const u8) ![2][]u8 {
+    const trimmed = std.mem.trimRight(u8, source, "/");
+    if (std.mem.endsWith(u8, trimmed, "/.well-known/skills/default/skill.md") or
+        std.mem.endsWith(u8, trimmed, "/skill.md"))
+    {
+        return .{
+            try allocator.dupe(u8, trimmed),
+            try allocator.dupe(u8, trimmed),
+        };
+    }
+
+    return .{
+        try std.fmt.allocPrint(allocator, "{s}/.well-known/skills/default/skill.md", .{trimmed}),
+        try std.fmt.allocPrint(allocator, "{s}/skill.md", .{trimmed}),
+    };
+}
+
+fn sanitizeWebSkillName(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const host = net_security.extractHost(source) orelse return allocator.dupe(u8, "web-skill");
+    var out = try allocator.alloc(u8, host.len);
+    var n: usize = 0;
+    for (host) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_' or c == '.') {
+            out[n] = c;
+        } else {
+            out[n] = '-';
+        }
+        n += 1;
+    }
+    while (n > 0 and out[n - 1] == '-') n -= 1;
+    if (n == 0) {
+        allocator.free(out);
+        return allocator.dupe(u8, "web-skill");
+    }
+    return allocator.realloc(out, n);
+}
+
+const WebSkillManifest = struct {
+    name: ?[]const u8 = null,
+    skill_url: ?[]const u8 = null,
+};
+
+fn buildWellKnownSkillManifestUrl(allocator: std.mem.Allocator, source: []const u8) ![]u8 {
+    const trimmed = std.mem.trimRight(u8, source, "/");
+    if (std.mem.endsWith(u8, trimmed, "/.well-known/nullclaw-skill.json")) {
+        return allocator.dupe(u8, trimmed);
+    }
+    return std.fmt.allocPrint(allocator, "{s}/.well-known/nullclaw-skill.json", .{trimmed});
+}
+
+fn parseWebSkillManifest(json_bytes: []const u8) WebSkillManifest {
+    return .{
+        .name = json_miniparse.parseStringField(json_bytes, "name"),
+        .skill_url = json_miniparse.parseStringField(json_bytes, "skill_url"),
+    };
+}
+
 fn clearInstallErrorDetail(allocator: std.mem.Allocator, detail_out: ?*?[]u8) void {
     if (detail_out) |slot| {
         if (slot.*) |old| allocator.free(old);
@@ -1050,6 +1113,10 @@ fn stripQueryAndFragment(target: []const u8) []const u8 {
     if (std.mem.indexOfScalar(u8, target, '#')) |idx| end = @min(end, idx);
     if (std.mem.indexOfScalar(u8, target, '?')) |idx| end = @min(end, idx);
     return target[0..end];
+}
+
+fn isSafeHttpsSkillUrl(url: []const u8) bool {
+    return std.mem.startsWith(u8, url, "https://") and endsWithAsciiIgnoreCase(stripQueryAndFragment(url), ".md");
 }
 
 fn urlScheme(target: []const u8) ?[]const u8 {
@@ -1754,6 +1821,113 @@ fn installSkillFromGit(
 }
 
 /// Install a skill from either a local path or a git source URL, with optional error detail output.
+fn installSkillFromWellKnownUrl(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    // NOTE: No unit test for the live HTTP fetch path — it would require network I/O.
+    // Covered by deterministic tests for URL discovery helpers below and manual integration.
+    const manifest_url = try buildWellKnownSkillManifestUrl(allocator, source);
+    defer allocator.free(manifest_url);
+
+    var urls = try buildWellKnownSkillUrls(allocator, source);
+    defer allocator.free(urls[0]);
+    defer allocator.free(urls[1]);
+
+    var fetched_body: ?[]u8 = null;
+    var fetched_url: ?[]const u8 = null;
+    var installed_name: ?[]u8 = null;
+    defer if (fetched_body) |body| allocator.free(body);
+    defer if (installed_name) |name| allocator.free(name);
+
+    const timeout = "20";
+    const manifest_resp = http_util.curlGetWithStatusAndTimeout(allocator, manifest_url, &.{}, timeout) catch null;
+    if (manifest_resp) |resp| {
+        defer allocator.free(resp.body);
+        if (resp.status_code >= 200 and resp.status_code < 300) {
+            const manifest = parseWebSkillManifest(resp.body);
+            if (manifest.name) |name| {
+                try validateSkillName(name);
+                installed_name = try allocator.dupe(u8, name);
+            }
+            if (manifest.skill_url) |skill_url| {
+                if (!isSafeHttpsSkillUrl(skill_url)) {
+                    setInstallErrorDetail(allocator, detail_out, "web skill manifest returned an unsafe skill_url");
+                    return error.SkillSecurityAuditFailed;
+                }
+                allocator.free(urls[0]);
+                allocator.free(urls[1]);
+                urls = .{
+                    try allocator.dupe(u8, skill_url),
+                    try allocator.dupe(u8, skill_url),
+                };
+            }
+        }
+    }
+
+    for (urls) |candidate_url| {
+        const resp = http_util.curlGetWithStatusAndTimeout(allocator, candidate_url, &.{}, timeout) catch |err| switch (err) {
+            error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError, error.CurlFailed, error.CurlReadError, error.CurlWaitError => {
+                setInstallErrorDetail(allocator, detail_out, "failed to fetch skill from web source");
+                return err;
+            },
+            else => return err,
+        };
+        defer allocator.free(resp.body);
+
+        if (resp.status_code == 404) continue;
+        if (resp.status_code < 200 or resp.status_code >= 300) {
+            const msg = try std.fmt.allocPrint(allocator, "web skill discovery failed: GET {s} returned HTTP {d}", .{ candidate_url, resp.status_code });
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+            return error.ManifestNotFound;
+        }
+
+        fetched_body = try allocator.dupe(u8, resp.body);
+        fetched_url = candidate_url;
+        break;
+    }
+
+    if (fetched_body == null) {
+        setInstallErrorDetail(allocator, detail_out, "web source did not expose /.well-known/skills/default/skill.md or /skill.md");
+        return error.ManifestNotFound;
+    }
+
+    const tmp_root = try platform.getTempDir(allocator);
+    defer allocator.free(tmp_root);
+    const skill_dir_name = if (installed_name) |name|
+        try allocator.dupe(u8, name)
+    else
+        try sanitizeWebSkillName(allocator, source);
+    defer allocator.free(skill_dir_name);
+    const temp_dir = try std.fmt.allocPrint(allocator, "{s}/nullclaw-skill-{x}", .{ tmp_root, std.hash.Wyhash.hash(0, source) });
+    defer allocator.free(temp_dir);
+    std.fs.deleteTreeAbsolute(temp_dir) catch {};
+    try fs_compat.makePath(temp_dir);
+    defer std.fs.deleteTreeAbsolute(temp_dir) catch {};
+
+    const skill_md_path = try std.fmt.allocPrint(allocator, "{s}/SKILL.md", .{temp_dir});
+    defer allocator.free(skill_md_path);
+    const file = try std.fs.createFileAbsolute(skill_md_path, .{});
+    defer file.close();
+    try file.writeAll(fetched_body.?);
+
+    installSkillDirectoryToWorkspace(allocator, temp_dir, workspace_dir, skill_dir_name) catch |err| {
+        if (err == error.SkillAlreadyExists) {
+            const msg = try std.fmt.allocPrint(allocator, "skill '{s}' already exists", .{skill_dir_name});
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+        } else if (fetched_url) |url| {
+            const msg = try std.fmt.allocPrint(allocator, "failed to install skill fetched from {s}: {s}", .{ url, @errorName(err) });
+            defer allocator.free(msg);
+            setInstallErrorDetail(allocator, detail_out, msg);
+        }
+        return err;
+    };
+}
+
 pub fn installSkillWithDetail(
     allocator: std.mem.Allocator,
     source: []const u8,
@@ -1761,6 +1935,12 @@ pub fn installSkillWithDetail(
     detail_out: ?*?[]u8,
 ) !void {
     clearInstallErrorDetail(allocator, detail_out);
+    if (isHttpSource(source)) {
+        installSkillFromWellKnownUrl(allocator, source, workspace_dir, detail_out) catch |err| switch (err) {
+            error.ManifestNotFound => {},
+            else => return err,
+        };
+    }
     if (isGitSource(source)) {
         return installSkillFromGit(allocator, source, workspace_dir, detail_out);
     }
@@ -2617,6 +2797,59 @@ test "isGitSource rejects local paths and invalid inputs" {
     for (sources) |source| {
         try std.testing.expect(!isGitSource(source));
     }
+}
+
+test "isHttpSource recognizes web URLs only" {
+    try std.testing.expect(isHttpSource("https://example.com"));
+    try std.testing.expect(isHttpSource("http://example.com/docs"));
+    try std.testing.expect(!isHttpSource("git@github.com:owner/repo.git"));
+    try std.testing.expect(!isHttpSource("./skills/demo"));
+}
+
+test "buildWellKnownSkillUrls appends default discovery paths" {
+    const urls = try buildWellKnownSkillUrls(std.testing.allocator, "https://example.com/docs");
+    defer std.testing.allocator.free(urls[0]);
+    defer std.testing.allocator.free(urls[1]);
+
+    try std.testing.expectEqualStrings("https://example.com/docs/.well-known/skills/default/skill.md", urls[0]);
+    try std.testing.expectEqualStrings("https://example.com/docs/skill.md", urls[1]);
+}
+
+test "buildWellKnownSkillUrls preserves direct skill URL" {
+    const urls = try buildWellKnownSkillUrls(std.testing.allocator, "https://example.com/.well-known/skills/default/skill.md");
+    defer std.testing.allocator.free(urls[0]);
+    defer std.testing.allocator.free(urls[1]);
+
+    try std.testing.expectEqualStrings("https://example.com/.well-known/skills/default/skill.md", urls[0]);
+    try std.testing.expectEqualStrings("https://example.com/.well-known/skills/default/skill.md", urls[1]);
+}
+
+test "sanitizeWebSkillName derives safe host-based install name" {
+    const name = try sanitizeWebSkillName(std.testing.allocator, "https://docs.example.com/path");
+    defer std.testing.allocator.free(name);
+
+    try std.testing.expectEqualStrings("docs.example.com", name);
+}
+
+test "buildWellKnownSkillManifestUrl appends manifest path" {
+    const url = try buildWellKnownSkillManifestUrl(std.testing.allocator, "https://example.com/docs");
+    defer std.testing.allocator.free(url);
+
+    try std.testing.expectEqualStrings("https://example.com/docs/.well-known/nullclaw-skill.json", url);
+}
+
+test "parseWebSkillManifest reads name and skill_url" {
+    const manifest = parseWebSkillManifest(
+        \\{"name":"demo-skill","skill_url":"https://example.com/skill.md"}
+    );
+    try std.testing.expectEqualStrings("demo-skill", manifest.name.?);
+    try std.testing.expectEqualStrings("https://example.com/skill.md", manifest.skill_url.?);
+}
+
+test "isSafeHttpsSkillUrl requires https markdown URL" {
+    try std.testing.expect(isSafeHttpsSkillUrl("https://example.com/skill.md"));
+    try std.testing.expect(!isSafeHttpsSkillUrl("http://example.com/skill.md"));
+    try std.testing.expect(!isSafeHttpsSkillUrl("https://example.com/skill.json"));
 }
 
 test "classifyGitCloneError maps common git clone failures" {
