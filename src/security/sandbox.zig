@@ -82,3 +82,62 @@ pub const detectAvailable = @import("detect.zig").detectAvailable;
 pub const AvailableBackends = @import("detect.zig").AvailableBackends;
 
 // ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+test "NoopSandbox is always available" {
+    var ns = NoopSandbox{};
+    try testing.expect(ns.sandbox().isAvailable());
+}
+
+test "NoopSandbox name is 'none'" {
+    var ns = NoopSandbox{};
+    try testing.expectEqualStrings("none", ns.sandbox().name());
+}
+
+test "NoopSandbox description is non-empty" {
+    var ns = NoopSandbox{};
+    const desc = ns.sandbox().description();
+    try testing.expect(desc.len > 0);
+}
+
+test "NoopSandbox wrapCommand passes argv through unchanged" {
+    var ns = NoopSandbox{};
+    const sandbox = ns.sandbox();
+    const argv = &[_][]const u8{ "echo", "hello" };
+    var buf: [2][]const u8 = undefined;
+    const result = try sandbox.wrapCommand(argv, &buf);
+    try testing.expectEqual(@as(usize, 2), result.len);
+    try testing.expectEqualStrings("echo", result[0]);
+    try testing.expectEqualStrings("hello", result[1]);
+}
+
+test "NoopSandbox wrapCommand with empty argv" {
+    var ns = NoopSandbox{};
+    const sandbox = ns.sandbox();
+    const argv: []const []const u8 = &.{};
+    var buf: [0][]const u8 = undefined;
+    const result = try sandbox.wrapCommand(argv, &buf);
+    try testing.expectEqual(@as(usize, 0), result.len);
+}
+
+test "Sandbox interface dispatches to NoopSandbox correctly" {
+    var ns = NoopSandbox{};
+    const sb = ns.sandbox();
+    try testing.expect(sb.isAvailable());
+    try testing.expectEqualStrings("none", sb.name());
+    try testing.expect(sb.description().len > 0);
+}
+
+test "createNoopSandbox returns functional sandbox" {
+    var ns = createNoopSandbox();
+    const sb = ns.sandbox();
+    try testing.expect(sb.isAvailable());
+    try testing.expectEqualStrings("none", sb.name());
+}
+
+test "SandboxBackend enum exhaustiveness" {
+    inline for (.{ SandboxBackend.auto, SandboxBackend.none, SandboxBackend.landlock, SandboxBackend.firejail, SandboxBackend.bubblewrap, SandboxBackend.docker }) |backend| {
+        try testing.expect(@as(SandboxBackend, backend) == backend);
+    }
+}
