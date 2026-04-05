@@ -172,6 +172,8 @@ const GatewayThreadObserver = struct {
         .record_metric = recordMetric,
         .flush = flush,
         .name = name,
+        .get_trace_id = getTraceId,
+        .set_trace_id = setTraceId,
     };
 
     pub fn init(allocator: std.mem.Allocator) GatewayThreadObserver {
@@ -246,6 +248,10 @@ const GatewayThreadObserver = struct {
 
     fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
     fn flush(_: *anyopaque) void {}
+    fn getTraceId(_: *anyopaque) ?[32]u8 {
+        return null;
+    }
+    fn setTraceId(_: *anyopaque, _: [32]u8) void {}
     fn name(_: *anyopaque) []const u8 {
         return "gateway_thread";
     }

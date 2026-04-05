@@ -5,6 +5,7 @@ const platform = @import("platform.zig");
 const bus = @import("bus.zig");
 const fs_compat = @import("fs_compat.zig");
 const json_util = @import("json_util.zig");
+const observability = @import("observability.zig");
 const agent_routing = @import("agent_routing.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
@@ -472,6 +473,7 @@ pub const CronScheduler = struct {
     allocator: std.mem.Allocator,
     shell_cwd: ?[]const u8 = null,
     agent_timeout_secs: u64 = 0,
+    observer: ?observability.Observer = null,
 
     pub fn init(allocator: std.mem.Allocator, max_tasks: usize, enabled: bool) CronScheduler {
         return .{
@@ -873,6 +875,15 @@ pub const CronScheduler = struct {
         for (self.jobs.items, 0..) |*job, idx| {
             if (job.paused or job.next_run_secs > now) continue;
             changed = true;
+
+            if (self.observer) |obs| {
+                const event = observability.ObserverEvent{ .cron_job_start = .{
+                    .task = job.command,
+                    .channel = job.delivery.channel,
+                    .bot_account = job.delivery.account_id,
+                } };
+                obs.recordEvent(&event);
+            }
 
             switch (job.job_type) {
                 .shell => {
@@ -3688,6 +3699,71 @@ test "tick without bus still executes jobs" {
     // Job should have been executed and rescheduled
     try std.testing.expectEqualStrings("ok", scheduler.jobs.items[0].last_status.?);
     try std.testing.expect(scheduler.jobs.items[0].next_run_secs > 0);
+}
+
+test "tick records cron start delivery attribution" {
+    const RecordingObserver = struct {
+        saw_cron_job_start: bool = false,
+        last_channel: ?[]const u8 = null,
+        last_bot_account: ?[]const u8 = null,
+
+        const vtable = observability.Observer.VTable{
+            .record_event = recordEvent,
+            .record_metric = recordMetric,
+            .flush = flush,
+            .name = name,
+            .get_trace_id = getTraceId,
+            .set_trace_id = setTraceId,
+        };
+
+        fn observer(self: *@This()) observability.Observer {
+            return .{
+                .ptr = @ptrCast(self),
+                .vtable = &vtable,
+            };
+        }
+
+        fn recordEvent(ptr: *anyopaque, event: *const observability.ObserverEvent) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            switch (event.*) {
+                .cron_job_start => |payload| {
+                    self.saw_cron_job_start = true;
+                    self.last_channel = payload.channel;
+                    self.last_bot_account = payload.bot_account;
+                },
+                else => {},
+            }
+        }
+
+        fn recordMetric(_: *anyopaque, _: *const observability.ObserverMetric) void {}
+        fn flush(_: *anyopaque) void {}
+        fn name(_: *anyopaque) []const u8 {
+            return "recording";
+        }
+        fn getTraceId(_: *anyopaque) ?[32]u8 {
+            return null;
+        }
+        fn setTraceId(_: *anyopaque, _: [32]u8) void {}
+    };
+
+    const allocator = std.testing.allocator;
+    var scheduler = CronScheduler.init(allocator, 10, true);
+    defer scheduler.deinit();
+
+    var observer = RecordingObserver{};
+    scheduler.observer = observer.observer();
+
+    _ = try scheduler.addJob("* * * * *", "echo attributed");
+    scheduler.jobs.items[0].delivery.channel = "telegram";
+    scheduler.jobs.items[0].delivery.account_id = "bot-main";
+    scheduler.jobs.items[0].next_run_secs = 0;
+
+    // Regression: cron_job_start should preserve the delivery metadata carried by the job.
+    _ = scheduler.tick(0, null);
+
+    try std.testing.expect(observer.saw_cron_job_start);
+    try std.testing.expectEqualStrings("telegram", observer.last_channel.?);
+    try std.testing.expectEqualStrings("bot-main", observer.last_bot_account.?);
 }
 
 test "tick reschedules recurring job using cron expression" {

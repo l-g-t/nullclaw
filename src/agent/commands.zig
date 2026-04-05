@@ -1422,7 +1422,7 @@ fn executeSkillInvocation(self: anytype, skill: *const skills_mod.Skill, user_in
 }
 
 fn tryHandleDirectSkillCommand(self: anytype, cmd: SlashCommand) !?[]const u8 {
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch return null;
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch return null;
     defer skills_mod.freeSkills(self.allocator, skills);
 
     var resolved: ?DirectSkillCommandMatch = null;
@@ -3495,7 +3495,7 @@ fn handleSkillCommand(self: anytype, arg: []const u8) ![]const u8 {
         return try self.allocator.dupe(u8, "Skills reloaded for this session. Updated skill instructions will apply on the next turn.");
     }
 
-    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir) catch |err| {
+    const skills = skills_mod.listSkills(self.allocator, self.workspace_dir, self.observer) catch |err| {
         return try std.fmt.allocPrint(self.allocator, "Failed to load skills: {s}", .{@errorName(err)});
     };
     defer skills_mod.freeSkills(self.allocator, skills);
