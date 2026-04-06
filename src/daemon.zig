@@ -22,6 +22,7 @@ const agent_routing = @import("agent_routing.zig");
 const channel_catalog = @import("channel_catalog.zig");
 const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
+const inbound_debounce = @import("inbound_debounce.zig");
 const interaction_choices = @import("interactions/choices.zig");
 const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
@@ -32,6 +33,7 @@ const buildConversationContext = @import("agent/prompt.zig").buildConversationCo
 const thread_stacks = @import("thread_stacks.zig");
 const tunnel_mod = @import("tunnel.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
+const observability = @import("observability.zig");
 
 const log = std.log.scoped(.daemon);
 
@@ -458,7 +460,27 @@ fn mergeSchedulerTickChangesAndSave(
 /// so tasks created/updated after daemon startup are picked up without restart.
 fn schedulerThread(allocator: std.mem.Allocator, config: *const Config, state: *DaemonState, event_bus: *bus_mod.Bus) void {
     const gateway_mod = @import("gateway.zig");
+
+    const runtime_observer = observability.RuntimeObserver.create(
+        allocator,
+        .{
+            .workspace_dir = config.workspace_dir,
+            .backend = config.diagnostics.backend,
+            .otel_endpoint = config.diagnostics.otel_endpoint,
+            .otel_service_name = config.diagnostics.otel_service_name,
+        },
+        config.diagnostics.otel_headers,
+        &.{},
+    ) catch blk: {
+        log.warn("Failed to create scheduler runtime observer, falling back to noop", .{});
+        break :blk null;
+    };
+    defer if (runtime_observer) |ro| ro.destroy();
+
     var scheduler = CronScheduler.init(allocator, config.scheduler.max_tasks, config.scheduler.enabled);
+    if (runtime_observer) |ro| {
+        scheduler.observer = ro.observer();
+    }
     scheduler.setShellCwd(config.workspace_dir);
     scheduler.setAgentTimeoutSecs(config.scheduler.agent_timeout_secs);
     defer scheduler.deinit();
@@ -993,6 +1015,40 @@ fn makeStreamingSinkForChannel(
     return filter.sink();
 }
 
+const DebouncedInboundPollResult = enum {
+    idle,
+    ready,
+    closed,
+};
+
+fn pollDebouncedInbound(
+    _: std.mem.Allocator,
+    event_bus: *bus_mod.Bus,
+    debouncer: *inbound_debounce.InboundDebouncer,
+    ready_messages: *std.ArrayListUnmanaged(bus_mod.InboundMessage),
+) DebouncedInboundPollResult {
+    const timeout_ms = debouncer.nextPollTimeoutMs(inbound_debounce.nowMs());
+    const maybe_msg = event_bus.consumeInboundTimeout(timeout_ms) catch |err| switch (err) {
+        error.Timeout => {
+            debouncer.flushMatured(inbound_debounce.nowMs(), ready_messages) catch |flush_err| {
+                log.warn("inbound debounce flush failed: {}", .{flush_err});
+            };
+            return if (ready_messages.items.len > 0) .ready else .idle;
+        },
+    };
+    if (maybe_msg) |msg| {
+        debouncer.push(msg, inbound_debounce.nowMs(), ready_messages) catch |push_err| {
+            log.warn("inbound debounce push failed: {}", .{push_err});
+        };
+        return if (ready_messages.items.len > 0) .ready else .idle;
+    }
+
+    debouncer.flushMatured(inbound_debounce.nowMs(), ready_messages) catch |flush_err| {
+        log.warn("inbound debounce flush failed: {}", .{flush_err});
+    };
+    return if (ready_messages.items.len > 0) .ready else .closed;
+}
+
 fn inboundDispatcherThread(
     allocator: std.mem.Allocator,
     event_bus: *bus_mod.Bus,
@@ -1001,138 +1057,168 @@ fn inboundDispatcherThread(
     state: *DaemonState,
 ) void {
     var evict_counter: u32 = 0;
+    var debouncer = inbound_debounce.InboundDebouncer.init(allocator, runtime.config.messages.inbound.debounce_ms);
+    defer debouncer.deinit();
+    var ready_messages: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+    defer {
+        for (ready_messages.items) |msg| msg.deinit(allocator);
+        ready_messages.deinit(allocator);
+    }
 
-    while (event_bus.consumeInbound()) |msg| {
-        defer msg.deinit(allocator);
-
-        var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
-        defer parsed_meta.deinit();
-
-        const outbound_account_id = parsed_meta.fields.account_id;
-        const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
-            allocator,
-            runtime.config,
-            &msg,
-            parsed_meta.fields,
-        ) orelse resolveInboundRouteSessionKeyWithMetadata(
-            allocator,
-            runtime.config,
-            &msg,
-            parsed_meta.fields,
-        );
-        defer if (routed_session_key) |key| allocator.free(key);
-        const session_key = routed_session_key orelse msg.session_key;
-
-        const typing_recipient = sendInboundProcessingIndicator(
-            allocator,
-            registry,
-            msg.channel,
-            outbound_account_id,
-            msg.chat_id,
-            parsed_meta.fields,
-        );
-        defer clearInboundProcessingIndicator(
-            allocator,
-            registry,
-            msg.channel,
-            outbound_account_id,
-            typing_recipient,
-        );
-
-        const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
-        if (outbound_channel) |channel| {
-            markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
-        }
-        const use_tracked_draft_outbound = if (outbound_channel) |channel|
-            !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
-        else
-            false;
-        const use_streaming_outbound = if (outbound_channel) |channel|
-            channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
-        else
-            false;
-        const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
-        var streaming_ctx = StreamingOutboundCtx{
-            .allocator = allocator,
-            .event_bus = event_bus,
-            .channel = msg.channel,
-            .account_id = outbound_account_id,
-            .chat_id = msg.chat_id,
-            .draft_id = outbound_draft_id,
-        };
-        var stream_sink: ?streaming.Sink = null;
-        var outbound_tag_filter: streaming.TagFilter = undefined;
-        if (use_streaming_outbound) {
-            const raw_sink = streaming.Sink{
-                .callback = publishStreamingChunk,
-                .ctx = @ptrCast(&streaming_ctx),
+    while (true) {
+        if (debouncer.enabled()) {
+            switch (pollDebouncedInbound(allocator, event_bus, &debouncer, &ready_messages)) {
+                .ready => {},
+                .idle => continue,
+                .closed => break,
+            }
+        } else {
+            const msg = event_bus.consumeInbound() orelse break;
+            ready_messages.append(allocator, msg) catch {
+                msg.deinit(allocator);
+                continue;
             };
-            stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
         }
 
-        if (std.mem.eql(u8, msg.channel, "max")) {
-            channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
-            defer channels_mod.max.setInteractiveOwnerContext(null);
-        }
+        while (ready_messages.items.len > 0) {
+            var msg = ready_messages.orderedRemove(0);
+            defer msg.deinit(allocator);
 
-        const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
+            var parsed_meta = parseInboundMetadata(allocator, msg.metadata_json);
+            defer parsed_meta.deinit();
 
-        const reply = runtime.session_mgr.processMessageStreaming(
-            session_key,
-            msg.content,
-            conversation_context,
-            stream_sink,
-        ) catch |err| {
-            log.warn("inbound dispatch process failed: {}", .{err});
+            const outbound_account_id = parsed_meta.fields.account_id;
+            const routed_session_key = resolveInboundMainSessionKeyWithMetadata(
+                allocator,
+                runtime.config,
+                &msg,
+                parsed_meta.fields,
+            ) orelse resolveInboundRouteSessionKeyWithMetadata(
+                allocator,
+                runtime.config,
+                &msg,
+                parsed_meta.fields,
+            );
+            defer if (routed_session_key) |key| allocator.free(key);
+            const session_key = routed_session_key orelse msg.session_key;
 
-            // Send user-visible error reply back to the originating channel
-            const err_msg: []const u8 = switch (err) {
-                error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
-                error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
-                error.NoResponseContent => "Model returned an empty response. Please try again.",
-                error.OutOfMemory => "Out of memory.",
-                else => "An error occurred. Try again.",
-            };
-            var err_out = if (outbound_account_id) |aid|
-                bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
+            const typing_recipient = sendInboundProcessingIndicator(
+                allocator,
+                registry,
+                msg.channel,
+                outbound_account_id,
+                msg.chat_id,
+                parsed_meta.fields,
+            );
+            defer clearInboundProcessingIndicator(
+                allocator,
+                registry,
+                msg.channel,
+                outbound_account_id,
+                typing_recipient,
+            );
+
+            const outbound_channel = resolveOutboundChannel(registry, msg.channel, outbound_account_id);
+            if (outbound_channel) |channel| {
+                markInboundMessageRead(channel, buildInboundMessageRef(&msg, parsed_meta.fields));
+            }
+            const use_tracked_draft_outbound = if (outbound_channel) |channel|
+                !channel.supportsStreamingOutbound() and dispatch.supportsDraftStreaming(channel)
             else
-                bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
-            err_out.draft_id = outbound_draft_id;
-            event_bus.publishOutbound(err_out) catch {
-                err_out.deinit(allocator);
+                false;
+            const use_streaming_outbound = if (outbound_channel) |channel|
+                channel.supportsStreamingOutbound() or dispatch.supportsDraftStreaming(channel)
+            else
+                false;
+            const outbound_draft_id: u64 = if (use_tracked_draft_outbound) nextOutboundDraftId() else 0;
+            var streaming_ctx = StreamingOutboundCtx{
+                .allocator = allocator,
+                .event_bus = event_bus,
+                .channel = msg.channel,
+                .account_id = outbound_account_id,
+                .chat_id = msg.chat_id,
+                .draft_id = outbound_draft_id,
             };
-            continue;
-        };
-        defer allocator.free(reply);
+            var stream_sink: ?streaming.Sink = null;
+            var outbound_tag_filter: streaming.TagFilter = undefined;
+            if (use_streaming_outbound) {
+                const raw_sink = streaming.Sink{
+                    .callback = publishStreamingChunk,
+                    .ctx = @ptrCast(&streaming_ctx),
+                };
+                stream_sink = makeStreamingSinkForChannel(use_streaming_outbound, raw_sink, &outbound_tag_filter);
+            }
 
-        const out = makeAssistantReplyOutbound(
-            allocator,
-            msg.channel,
-            outbound_account_id,
-            msg.chat_id,
-            reply,
-            outbound_draft_id,
-        ) catch |err| {
-            log.err("inbound dispatch makeOutbound failed: {}", .{err});
-            continue;
-        };
+            if (std.mem.eql(u8, msg.channel, "max")) {
+                channels_mod.max.setInteractiveOwnerContext(msg.sender_id);
+                defer channels_mod.max.setInteractiveOwnerContext(null);
+            }
 
-        event_bus.publishOutbound(out) catch |err| {
-            out.deinit(allocator);
-            if (err == error.Closed) break;
-            log.err("inbound dispatch publishOutbound failed: {}", .{err});
-            continue;
-        };
+            const conversation_context = buildInboundConversationContext(&msg, parsed_meta.fields);
 
-        state.markRunning("inbound_dispatcher");
-        health.markComponentOk("inbound_dispatcher");
+            const reply = runtime.session_mgr.processMessageStreaming(
+                session_key,
+                msg.content,
+                conversation_context,
+                stream_sink,
+            ) catch |err| {
+                log.warn("inbound dispatch process failed: {}", .{err});
 
-        // Periodic session eviction for bus-based channels
-        evict_counter += 1;
-        if (evict_counter >= 100) {
-            evict_counter = 0;
-            _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+                // Send user-visible error reply back to the originating channel
+                const err_msg: []const u8 = switch (err) {
+                    error.CurlFailed, error.CurlReadError, error.CurlWaitError, error.CurlWriteError, error.CurlDnsError, error.CurlConnectError, error.CurlTimeout, error.CurlTlsError => "Network error contacting provider. Check base_url, DNS, proxy, and TLS certificates, then try again.",
+                    error.ProviderDoesNotSupportVision => "The current provider does not support image input.",
+                    error.NoResponseContent => "Model returned an empty response. Please try again.",
+                    error.OutOfMemory => "Out of memory.",
+                    else => "An error occurred. Try again.",
+                };
+                var err_out = if (outbound_account_id) |aid|
+                    bus_mod.makeOutboundWithAccount(allocator, msg.channel, aid, msg.chat_id, err_msg) catch continue
+                else
+                    bus_mod.makeOutbound(allocator, msg.channel, msg.chat_id, err_msg) catch continue;
+                err_out.draft_id = outbound_draft_id;
+                event_bus.publishOutbound(err_out) catch {
+                    err_out.deinit(allocator);
+                };
+                continue;
+            };
+            defer allocator.free(reply);
+
+            const out = makeAssistantReplyOutbound(
+                allocator,
+                msg.channel,
+                outbound_account_id,
+                msg.chat_id,
+                reply,
+                outbound_draft_id,
+            ) catch |err| {
+                log.err("inbound dispatch makeOutbound failed: {}", .{err});
+                continue;
+            };
+
+            event_bus.publishOutbound(out) catch |err| {
+                out.deinit(allocator);
+                if (err == error.Closed) break;
+                log.err("inbound dispatch publishOutbound failed: {}", .{err});
+                continue;
+            };
+
+            state.markRunning("inbound_dispatcher");
+            health.markComponentOk("inbound_dispatcher");
+
+            // Periodic session eviction for bus-based channels
+            evict_counter += 1;
+            if (evict_counter >= 100) {
+                evict_counter = 0;
+                _ = runtime.session_mgr.evictIdle(runtime.config.agent.session_idle_timeout_secs);
+            }
         }
+    }
+
+    debouncer.flushAll(&ready_messages) catch {};
+    while (ready_messages.items.len > 0) {
+        var msg = ready_messages.orderedRemove(0);
+        msg.deinit(allocator);
     }
 }
 
@@ -1275,15 +1361,24 @@ pub fn run(allocator: std.mem.Allocator, config: *const Config, host: []const u8
     // Channel runtime for supervised polling (provider, tools, sessions)
     var channel_rt: ?*channel_loop.ChannelRuntime = null;
     if (has_runtime_dependent_channels) {
-        channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
-            state.markError("channels", @errorName(err));
-            health.markComponentError("channels", "runtime init failed");
+        if (!channel_loop.hasStartupProviderCredentials(allocator, config)) {
+            state.markError("channels", "missing_provider_credentials");
+            health.markComponentError("channels", "missing_provider_credentials");
             stdout.print(
-                "Warning: channel runtime init failed ({s}); runtime-dependent channels disabled.\n",
-                .{@errorName(err)},
+                "Warning: channel runtime disabled; no usable startup credentials for provider {s}.\n",
+                .{config.default_provider},
             ) catch {};
-            break :blk null;
-        };
+        } else {
+            channel_rt = channel_loop.ChannelRuntime.init(allocator, config) catch |err| blk: {
+                state.markError("channels", @errorName(err));
+                health.markComponentError("channels", "runtime init failed");
+                stdout.print(
+                    "Warning: channel runtime init failed ({s}); runtime-dependent channels disabled.\n",
+                    .{@errorName(err)},
+                ) catch {};
+                break :blk null;
+            };
+        }
     }
     defer if (channel_rt) |rt| rt.deinit();
 
@@ -1455,6 +1550,68 @@ test "makeStreamingSinkForChannel returns null when streaming is disabled" {
         .ctx = undefined,
     }, &filter);
     try std.testing.expect(sink == null);
+}
+
+test "pollDebouncedInbound keeps dispatcher alive across idle timeout" {
+    const allocator = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var debouncer = inbound_debounce.InboundDebouncer.init(allocator, 3000);
+    defer debouncer.deinit();
+
+    var ready_messages: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+    defer {
+        for (ready_messages.items) |msg| msg.deinit(allocator);
+        ready_messages.deinit(allocator);
+    }
+
+    // Regression: debounced idle polls must not terminate the inbound dispatcher.
+    try std.testing.expectEqual(
+        DebouncedInboundPollResult.idle,
+        pollDebouncedInbound(allocator, &event_bus, &debouncer, &ready_messages),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ready_messages.items.len);
+}
+
+test "pollDebouncedInbound merge out-of-memory does not double free" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = failing.allocator();
+
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var debouncer = inbound_debounce.InboundDebouncer.init(allocator, 3000);
+    defer debouncer.deinit();
+
+    var ready_messages: std.ArrayListUnmanaged(bus_mod.InboundMessage) = .empty;
+    defer {
+        for (ready_messages.items) |msg| msg.deinit(allocator);
+        ready_messages.deinit(allocator);
+    }
+
+    try debouncer.push(
+        try bus_mod.makeInbound(allocator, "discord", "u1", "c1", "hello", "discord:c1"),
+        1_000,
+        &ready_messages,
+    );
+    try event_bus.publishInbound(try bus_mod.makeInbound(
+        allocator,
+        "discord",
+        "u1",
+        "c1",
+        "world",
+        "discord:c1",
+    ));
+
+    failing.fail_index = failing.alloc_index;
+
+    // Regression: merge allocation failure must not double-free the consumed bus message.
+    try std.testing.expectEqual(
+        DebouncedInboundPollResult.idle,
+        pollDebouncedInbound(allocator, &event_bus, &debouncer, &ready_messages),
+    );
+    try std.testing.expectEqual(@as(usize, 0), ready_messages.items.len);
 }
 
 test "hasSupervisedChannels false for defaults" {
@@ -2687,6 +2844,29 @@ test "channelSupervisorThread respects shutdown" {
     thread.join();
 
     // Channel component should have been marked running before the loop
+    try std.testing.expect(state.components[0].?.running);
+}
+
+test "schedulerThread respects shutdown and destroys runtime observer" {
+    shutdown_requested.store(true, .release);
+    defer shutdown_requested.store(false, .release);
+
+    const config = Config{
+        .workspace_dir = "/tmp",
+        .config_path = "/tmp/config.json",
+        .allocator = std.testing.allocator,
+    };
+
+    var state = DaemonState{};
+    state.addComponent("scheduler");
+    var event_bus = bus_mod.Bus.init();
+
+    // Regression: schedulerThread must release the heap-allocated RuntimeObserver on shutdown.
+    const thread = try std.Thread.spawn(.{ .stack_size = thread_stacks.DAEMON_SERVICE_STACK_SIZE }, schedulerThread, .{
+        std.testing.allocator, &config, &state, &event_bus,
+    });
+    thread.join();
+
     try std.testing.expect(state.components[0].?.running);
 }
 

@@ -229,6 +229,27 @@ nullclaw onboard --interactive
 - 两个命名 agent 即使使用相同的 provider/model，也可以保持各自独立的持久笔记和工作区。
 - `workspace_path` 本身不会决定聊天路由；路由仍然由 `bindings`、`/bind` 或显式 `--agent` / `/subagents spawn --agent` 决定。
 
+### `messages.inbound`
+
+- `debounce_ms` 用来延迟处理连续快速到达的纯文本入站消息，把短时间内的多条碎片合并成一次 turn。
+- 默认值：`3000`。
+- 作用范围包括 daemon 路由的入站文本和 Agent CLI REPL。
+- 设为 `0` 可关闭。
+- slash 命令和带媒体的入站消息会跳过 debounce。
+- Telegram 仍保留自己的长消息分段合并逻辑；这里的值会作为那条逻辑的基础 debounce 窗口。
+
+示例：
+
+```json
+{
+  "messages": {
+    "inbound": {
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
 ### `reliability`
 
 - 配置 LLM 提供者的全局重试和故障转移行为。
@@ -260,7 +281,6 @@ nullclaw onboard --interactive
 - 裸模型名的故障转移顺序：先尝试主要提供方，再依次尝试每个列出的 `fallback_provider`。
 - 像 `openai/gpt-4o` 这样的显式 `provider/model` 备用项会直接路由到对应 provider，不会再走通用 provider 扇出链路。
 - `api_keys`: (可选) 用于在速率限制 (429) 错误时轮换的额外 API 密钥列表。
-
 ### `identity`（AIEOS v1.1）
 
 如果你希望运行时身份来自 AIEOS 文档，可以使用这一节。配置后，nullclaw 会把解析后的 AIEOS 内容连同 `AGENTS.md`、`IDENTITY.md` 等工作区身份文件一起注入 system prompt：
@@ -607,12 +627,26 @@ Max 说明：
 - `auto_save`: 开启后会自动持久化会话记忆。
 - 可扩展 hybrid 检索与 embedding 配置（见根目录 `config.example.json`）。
 
+**注意**：`markdown_only` 内存配置文件会自动启用混合检索和时间衰减（半衰期 30 天），以实现最佳的相关性评分。这确保了对纯 markdown 文件的时间感知能力。
+
 ### `gateway`
 
 - 默认推荐：
   - `host = "127.0.0.1"`
   - `require_pairing = true`
 - 不建议直接公网监听；如需外网访问，优先使用 tunnel。
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `host` | `"127.0.0.1"` | 监听地址 |
+| `port` | `3000` | 监听端口 |
+| `require_pairing` | `true` | 所有 API 请求均需 bearer token |
+| `allow_public_bind` | `false` | 允许绑定非回环地址 |
+| `pair_rate_limit_per_minute` | `10` | 每 IP 每分钟最大 `/pair` 请求数 |
+| `webhook_rate_limit_per_minute` | `60` | 每 IP 每分钟最大 webhook 请求数 |
+| `idempotency_ttl_secs` | `300` | 幂等请求结果缓存时长（秒） |
+| `max_body_size_bytes` | `65536` | HTTP 请求体最大字节数（64 KB）。接受图片或文件负载时需调高（如 `20971520` 表示 20 MB）。 |
+| `request_timeout_secs` | `30` | 入站 HTTP 请求的 socket 读取超时（秒）。在慢速或高延迟连接下接受大体积负载时需调高。 |
 
 ### `tunnel`
 

@@ -28,6 +28,7 @@ const thread_stacks = @import("thread_stacks.zig");
 const control_plane = @import("control_plane.zig");
 const agent_bindings_config = @import("agent_bindings_config.zig");
 const fs_compat = @import("fs_compat.zig");
+const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
 const matrix = @import("channels/matrix.zig");
@@ -36,6 +37,72 @@ const channels_mod = @import("channels/root.zig");
 const Atomic = @import("portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.channel_loop);
+
+fn hasNonEmptyCredential(value: ?[]const u8) bool {
+    const credential = value orelse return false;
+    return std.mem.trim(u8, credential, " \t\r\n").len > 0;
+}
+
+fn providerHasStartupCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    provider_name: []const u8,
+) bool {
+    const resolved_key = providers.resolveApiKeyFromConfig(
+        allocator,
+        provider_name,
+        config.providers,
+    ) catch null;
+    defer if (resolved_key) |key| allocator.free(key);
+
+    if (hasNonEmptyCredential(resolved_key)) return true;
+
+    var holder = providers.ProviderHolder.fromConfigWithApiMode(
+        allocator,
+        provider_name,
+        null,
+        config.getProviderBaseUrl(provider_name),
+        config.getProviderNativeTools(provider_name),
+        config.getProviderUserAgent(provider_name),
+        config.getProviderApiMode(provider_name),
+        config.getProviderMaxStreamingPromptBytes(provider_name),
+        config.getProviderChatTemplateEnableThinkingParam(provider_name),
+    );
+    defer holder.deinit();
+
+    return switch (holder) {
+        .ollama => true,
+        .claude_cli, .codex_cli, .gemini_cli => true,
+        .openai_codex => |provider| provider.access_token != null,
+        .gemini => |provider| provider.auth != null,
+        .vertex => |provider| provider.auth != null and provider.base != null,
+        .compatible => !provider_probe.providerRequiresApiKey(provider_name, config.getProviderBaseUrl(provider_name)),
+        else => false,
+    };
+}
+
+fn hasReliabilityCredentialFallback(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    for (config.reliability.api_keys) |key| {
+        if (std.mem.trim(u8, key, " \t\r\n").len > 0) return true;
+    }
+
+    for (config.reliability.fallback_providers) |provider_name| {
+        if (providerHasStartupCredentials(allocator, config, provider_name)) return true;
+    }
+
+    return false;
+}
+
+pub fn hasStartupProviderCredentials(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+) bool {
+    if (providerHasStartupCredentials(allocator, config, config.default_provider)) return true;
+    return hasReliabilityCredentialFallback(allocator, config);
+}
 
 /// Set ScheduleTool's default chat_id for delivery context.
 fn setScheduleToolContext(
@@ -942,7 +1009,16 @@ fn telegramUpdateOffsetPath(allocator: std.mem.Allocator, config: *const Config,
     const file_name = try std.fmt.allocPrint(allocator, "update-offset-{s}.json", .{normalized_account_id});
     defer allocator.free(file_name);
 
-    return std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    const relative_path = try std.fs.path.join(allocator, &.{ config_dir, "state", "telegram", file_name });
+    defer allocator.free(relative_path);
+
+    if (std.fs.path.isAbsolute(relative_path)) {
+        return std.fs.path.resolve(allocator, &.{relative_path});
+    }
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std.fs.path.resolve(allocator, &.{ cwd, relative_path });
 }
 
 /// Load persisted Telegram update offset. Returns null when missing/invalid/stale.
@@ -1177,6 +1253,8 @@ pub const ChannelRuntime = struct {
             .subagent_manager = subagent_manager,
             .bootstrap_provider = bootstrap_provider,
             .backend_name = config.memory.backend,
+            .sandbox_backend = config.security.sandbox.backend,
+            .sandbox_enabled = config.sandboxEnabled(),
         }) catch &.{};
         errdefer if (tools.len > 0) tools_mod.deinitTools(allocator, tools);
 
@@ -1298,7 +1376,7 @@ pub fn runTelegramLoop(
     var evict_counter: u32 = 0;
 
     const model = config.default_model orelse {
-        log.err("No default model configured. Set agents.defaults.model.primary in ~/.nullclaw/config.json or run `nullclaw onboard`.", .{});
+        log.err("No default model configured. Set agents.defaults.model.primary in config.json in your nullclaw config directory or run `nullclaw onboard`.", .{});
         return;
     };
 
@@ -2470,6 +2548,36 @@ test "telegram update offset store roundtrip" {
     try saveTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token", 777);
     const restored = loadTelegramUpdateOffset(allocator, &cfg, "main", "12345:test-token");
     try std.testing.expectEqual(@as(?i64, 777), restored);
+}
+
+test "telegram update offset path resolves relative config path" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    const base = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(base);
+    const relative_base = try std.fs.path.relative(allocator, cwd, base);
+    defer allocator.free(relative_base);
+    const config_path = try std.fs.path.join(allocator, &.{ relative_base, "config.json" });
+    defer allocator.free(config_path);
+
+    const cfg = Config{
+        .workspace_dir = base,
+        .config_path = config_path,
+        .allocator = allocator,
+    };
+
+    const resolved = try telegramUpdateOffsetPath(allocator, &cfg, "default");
+    defer allocator.free(resolved);
+    const expected = try std.fs.path.join(allocator, &.{ base, "state", "telegram", "update-offset-default.json" });
+    defer allocator.free(expected);
+
+    try std.testing.expect(std.fs.path.isAbsolute(resolved));
+    try std.testing.expectEqualStrings(expected, resolved);
 }
 
 test "detailedProviderErrorForDisplay surfaces sanitized provider detail" {

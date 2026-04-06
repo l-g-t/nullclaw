@@ -288,6 +288,27 @@ Practical effect:
 - Two named agents can share the same provider/model family but keep separate durable notes and separate workspaces.
 - `workspace_path` does not route chats by itself. Routing still comes from `bindings`, `/bind`, or explicit `--agent` / `/subagents spawn --agent`.
 
+### `messages.inbound`
+
+- `debounce_ms` delays handling rapid-fire plain-text inbound messages so several short fragments can collapse into one turn.
+- Default: `3000`.
+- Applies to daemon-routed inbound text and the Agent CLI REPL.
+- Set `0` to disable it.
+- Slash commands and media-bearing inbound messages bypass debounce.
+- Telegram keeps its channel-specific split-message merge path; this setting becomes the base debounce window for that path.
+
+Example:
+
+```json
+{
+  "messages": {
+    "inbound": {
+      "debounce_ms": 1500
+    }
+  }
+}
+```
+
 ### `reliability`
 
 - Configures global retry and failover behavior for LLM providers.
@@ -319,7 +340,6 @@ Notes:
 - Failover order for bare model refs: primary provider first, then each listed `fallback_provider`.
 - Provider-qualified fallback refs such as `openai/gpt-4o` route directly to that provider and skip the generic provider fanout.
 - `api_keys`: (Optional) List of extra API keys for rotation on rate-limit (429) errors.
-
 ### `identity` (AIEOS v1.1)
 
 Use this section when you want the runtime identity to come from an AIEOS document.
@@ -794,6 +814,8 @@ Common issues:
 - `auto_save`: persists conversation memory automatically.
 - For hybrid retrieval and embedding settings, see root `config.example.json`.
 
+**Note**: The `markdown_only` memory profile automatically enables hybrid retrieval with temporal decay (half-life 30 days) for optimal relevance scoring. This ensures temporal awareness even with plain markdown files.
+
 ### `gateway`
 
 Recommended defaults:
@@ -802,6 +824,18 @@ Recommended defaults:
 - `require_pairing = true`
 
 Avoid direct public exposure. Use tunnel when external access is required.
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `host` | `"127.0.0.1"` | Listen address |
+| `port` | `3000` | Listen port |
+| `require_pairing` | `true` | Require bearer token on all API requests |
+| `allow_public_bind` | `false` | Allow binding to non-loopback addresses |
+| `pair_rate_limit_per_minute` | `10` | Max `/pair` requests per minute per IP |
+| `webhook_rate_limit_per_minute` | `60` | Max webhook requests per minute per IP |
+| `idempotency_ttl_secs` | `300` | Duration to cache idempotent request results |
+| `max_body_size_bytes` | `65536` | Maximum HTTP request body size in bytes (64 KB). Raise this when accepting image or file payloads (e.g. `20971520` for 20 MB). |
+| `request_timeout_secs` | `30` | Socket read timeout for incoming HTTP requests in seconds. Raise this when accepting large payloads over slow connections. |
 
 ### `tunnel`
 
