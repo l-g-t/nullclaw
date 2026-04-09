@@ -324,6 +324,8 @@ fn cloneChannelMessage(allocator: std.mem.Allocator, msg: root.ChannelMessage) !
         .timestamp = msg.timestamp,
         .reply_target = reply_target_dup,
         .message_id = msg.message_id,
+        .replace_message = msg.replace_message,
+        .is_interaction = msg.is_interaction,
         .first_name = first_name_dup,
         .is_group = msg.is_group,
     };
@@ -654,6 +656,7 @@ pub const TelegramChannel = struct {
     pending_media_received_at: std.ArrayListUnmanaged(u64) = .empty,
     pending_text_messages: std.ArrayListUnmanaged(root.ChannelMessage) = .empty,
     pending_text_received_at: std.ArrayListUnmanaged(u64) = .empty,
+    text_debounce_secs: u64 = telegram_ingress.TEXT_MESSAGE_DEBOUNCE_SECS,
     polls_since_temp_sweep: u32 = 0,
 
     typing_mu: std.Thread.Mutex = .{},
@@ -715,6 +718,11 @@ pub const TelegramChannel = struct {
             .last_update_id = 0,
             .proxy = null,
         };
+    }
+
+    pub fn textDebounceSecsFromMs(debounce_ms: u32) u64 {
+        if (debounce_ms == 0) return 0;
+        return @divFloor(@as(u64, debounce_ms) + 999, 1000);
     }
 
     pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.TelegramConfig) TelegramChannel {
@@ -2445,11 +2453,12 @@ pub const TelegramChannel = struct {
 
         var i: usize = 0;
         while (i < self.pending_text_messages.items.len) {
-            if (!telegram_ingress.pendingTextChainMatureAtIndex(
+            if (!telegram_ingress.pendingTextChainMatureAtIndexWithBase(
                 now,
                 self.pending_text_messages.items,
                 self.pending_text_received_at.items,
                 i,
+                self.text_debounce_secs,
             )) {
                 i += 1;
                 continue;
@@ -2507,7 +2516,11 @@ pub const TelegramChannel = struct {
             if (nextPendingMediaDeadline(self.pending_media_group_ids.items, self.pending_media_received_at.items)) |deadline| {
                 next_deadline = deadline;
             }
-            if (telegram_ingress.nextPendingTextDeadline(self.pending_text_messages.items, self.pending_text_received_at.items)) |deadline| {
+            if (telegram_ingress.nextPendingTextDeadlineWithBase(
+                self.pending_text_messages.items,
+                self.pending_text_received_at.items,
+                self.text_debounce_secs,
+            )) |deadline| {
                 if (next_deadline == null or deadline < next_deadline.?) next_deadline = deadline;
             }
 
@@ -2634,11 +2647,12 @@ pub const TelegramChannel = struct {
         {
             var i: usize = 0;
             while (i < messages.items.len) {
-                if (!telegram_ingress.shouldDebounceTextMessage(
+                if (!telegram_ingress.shouldDebounceTextMessageWithBase(
                     root.nowEpochSecs(),
                     self.pending_text_messages.items,
                     self.pending_text_received_at.items,
                     messages.items[i],
+                    self.text_debounce_secs,
                 )) {
                     // Explicitly cancel stale chain fragments for this sender/chat
                     // so a fresh message is not blocked by old pending chunks.
@@ -2791,6 +2805,7 @@ pub const TelegramChannel = struct {
                     .timestamp = root.nowEpochSecs(),
                     .message_id = chat.message_id,
                     .replace_message = std.mem.startsWith(u8, ok.submit_text, "/model "),
+                    .is_interaction = true,
                     .first_name = fn_dup,
                     .is_group = chat.is_group,
                 }) catch {
@@ -5327,6 +5342,34 @@ test "telegram consumeCallbackSelection rejects expired interaction" {
     }
 }
 
+test "cloneChannelMessage preserves interaction routing metadata" {
+    const allocator = std.testing.allocator;
+    var original = root.ChannelMessage{
+        .id = try allocator.dupe(u8, "alice"),
+        .sender = try allocator.dupe(u8, "12345"),
+        .content = try allocator.dupe(u8, "/model page 2"),
+        .channel = "telegram",
+        .timestamp = 42,
+        .reply_target = try allocator.dupe(u8, "12345"),
+        .message_id = 99,
+        .replace_message = true,
+        .is_interaction = true,
+        .first_name = try allocator.dupe(u8, "Alice"),
+        .is_group = true,
+    };
+    defer original.deinit(allocator);
+
+    var cloned = try cloneChannelMessage(allocator, original);
+    defer cloned.deinit(allocator);
+
+    try std.testing.expect(cloned.replace_message);
+    try std.testing.expect(cloned.is_interaction);
+    try std.testing.expect(cloned.is_group);
+    try std.testing.expectEqual(@as(?i64, 99), cloned.message_id);
+    try std.testing.expectEqualStrings("12345", cloned.reply_target.?);
+    try std.testing.expectEqualStrings("Alice", cloned.first_name.?);
+}
+
 // ════════════════════════════════════════════════════════════════════════════
 // Draft Streaming Tests
 // ════════════════════════════════════════════════════════════════════════════
@@ -5708,6 +5751,13 @@ test "parseTelegramTarget extracts topic suffix" {
     const parsed = parseTelegramTarget("-100123#topic:77");
     try std.testing.expectEqualStrings("-100123", parsed.chat_id);
     try std.testing.expectEqual(@as(?i64, 77), parsed.message_thread_id);
+}
+
+test "TelegramChannel textDebounceSecsFromMs rounds up milliseconds" {
+    try std.testing.expectEqual(@as(u64, 0), TelegramChannel.textDebounceSecsFromMs(0));
+    try std.testing.expectEqual(@as(u64, 1), TelegramChannel.textDebounceSecsFromMs(1));
+    try std.testing.expectEqual(@as(u64, 3), TelegramChannel.textDebounceSecsFromMs(3000));
+    try std.testing.expectEqual(@as(u64, 4), TelegramChannel.textDebounceSecsFromMs(3001));
 }
 
 test "createForumTopicFromTarget rejects empty name" {

@@ -36,7 +36,8 @@
       "accounts": {
         "main": {
           "bot_token": "YOUR_TELEGRAM_BOT_TOKEN",
-          "allow_from": ["YOUR_TELEGRAM_USER_ID"]
+          "allow_from": ["YOUR_TELEGRAM_USER_ID"],
+          "draft_previews": false
         }
       }
     },
@@ -202,8 +203,13 @@
   "reliability": {
     "provider_retries": 2,
     "provider_backoff_ms": 500,
-    "fallback_providers": [],
-    "model_fallbacks": []
+    "fallback_providers": ["groq", "openai"],
+    "model_fallbacks": [
+      {
+        "model": "anthropic/claude-sonnet-4",
+        "fallbacks": ["openai/gpt-4o", "groq/llama-3.3-70b"]
+      }
+    ]
   },
 
   "autonomy": {
