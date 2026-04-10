@@ -2,12 +2,39 @@ const std = @import("std");
 const builtin = @import("builtin");
 const root = @import("root.zig");
 const bus_mod = @import("../bus.zig");
+const interaction_choices = @import("../interactions/choices.zig");
 const websocket = @import("../websocket.zig");
 const thread_stacks = @import("../thread_stacks.zig");
 
 const Atomic = @import("../portable_atomic.zig").Atomic;
 
 const log = std.log.scoped(.discord);
+
+const PENDING_INTERACTION_TTL_MS: u64 = 60 * std.time.ms_per_min;
+
+const PendingInteractionOption = struct {
+    id: []const u8,
+    label: []const u8,
+    submit_text: []const u8,
+
+    fn deinit(self: *const PendingInteractionOption, allocator: std.mem.Allocator) void {
+        allocator.free(self.id);
+        allocator.free(self.label);
+        allocator.free(self.submit_text);
+    }
+};
+
+const PendingInteraction = struct {
+    expires_at_ms: u64,
+    chat_id: []const u8,
+    options: []PendingInteractionOption,
+
+    fn deinit(self: *const PendingInteraction, allocator: std.mem.Allocator) void {
+        allocator.free(self.chat_id);
+        for (self.options) |opt| opt.deinit(allocator);
+        allocator.free(self.options);
+    }
+};
 
 /// Discord channel — connects via WebSocket gateway, sends via REST API.
 /// Splits messages at 2000 chars (Discord limit).
@@ -26,6 +53,9 @@ pub const DiscordChannel = struct {
 
     typing_mu: std.Thread.Mutex = .{},
     typing_handles: std.StringHashMapUnmanaged(*TypingTask) = .empty,
+    interaction_mu: std.Thread.Mutex = .{},
+    pending_interactions: std.StringHashMapUnmanaged(PendingInteraction) = .empty,
+    interaction_seq: Atomic(u64) = Atomic(u64).init(1),
 
     // Gateway state
     running: Atomic(bool) = Atomic(bool).init(false),
@@ -105,6 +135,20 @@ pub const DiscordChannel = struct {
         var fbs = std.io.fixedBufferStream(buf);
         const w = fbs.writer();
         try w.print("https://discord.com/api/v10/channels/{s}/typing", .{channel_id});
+        return fbs.getWritten();
+    }
+
+    pub fn editMessageUrl(buf: []u8, channel_id: []const u8, message_id: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/channels/{s}/messages/{s}", .{ channel_id, message_id });
+        return fbs.getWritten();
+    }
+
+    fn interactionCallbackUrl(buf: []u8, interaction_id: []const u8, interaction_token: []const u8) ![]const u8 {
+        var fbs = std.io.fixedBufferStream(buf);
+        const w = fbs.writer();
+        try w.print("https://discord.com/api/v10/interactions/{s}/{s}/callback", .{ interaction_id, interaction_token });
         return fbs.getWritten();
     }
 
@@ -365,6 +409,339 @@ pub const DiscordChannel = struct {
         self.allocator.free(resp);
     }
 
+    fn sendJsonMethod(self: *DiscordChannel, method: []const u8, url: []const u8, body: []const u8) !void {
+        var argv_buf: [16][]const u8 = undefined;
+        var argc: usize = 0;
+        argv_buf[argc] = "curl";
+        argc += 1;
+        argv_buf[argc] = "-s";
+        argc += 1;
+        argv_buf[argc] = "-X";
+        argc += 1;
+        argv_buf[argc] = method;
+        argc += 1;
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = "Content-Type: application/json";
+        argc += 1;
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        argv_buf[argc] = "-H";
+        argc += 1;
+        argv_buf[argc] = auth_fbs.getWritten();
+        argc += 1;
+        argv_buf[argc] = "--data-binary";
+        argc += 1;
+        argv_buf[argc] = "@-";
+        argc += 1;
+        argv_buf[argc] = url;
+        argc += 1;
+
+        var child = std.process.Child.init(argv_buf[0..argc], self.allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Pipe;
+        child.stderr_behavior = .Ignore;
+        try child.spawn();
+
+        if (child.stdin) |stdin_file| {
+            stdin_file.writeAll(body) catch {
+                stdin_file.close();
+                child.stdin = null;
+                _ = child.kill() catch {};
+                _ = child.wait() catch {};
+                return error.CurlWriteError;
+            };
+            stdin_file.close();
+            child.stdin = null;
+        } else {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlWriteError;
+        }
+
+        const stdout = child.stdout.?.readToEndAlloc(self.allocator, 64 * 1024) catch {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+            return error.CurlReadError;
+        };
+        defer self.allocator.free(stdout);
+
+        const term = child.wait() catch return error.CurlWaitError;
+        switch (term) {
+            .Exited => |code| if (code != 0) return error.DiscordApiError,
+            else => return error.DiscordApiError,
+        }
+    }
+
+    fn nextInteractionToken(self: *DiscordChannel) ![]u8 {
+        const seq = self.interaction_seq.fetchAdd(1, .monotonic) + 1;
+        var buf: [32]u8 = undefined;
+        const token = try std.fmt.bufPrint(&buf, "{x}", .{seq});
+        return self.allocator.dupe(u8, token);
+    }
+
+    fn buildChoicesDirectiveFromPayload(
+        self: *DiscordChannel,
+        choices: []const root.Channel.OutboundChoice,
+    ) !interaction_choices.ChoicesDirective {
+        if (choices.len < interaction_choices.MIN_OPTIONS or choices.len > interaction_choices.MAX_OPTIONS) {
+            return error.InvalidChoices;
+        }
+
+        var options = try self.allocator.alloc(interaction_choices.ChoiceOption, choices.len);
+        var built: usize = 0;
+        errdefer {
+            for (options[0..built]) |opt| opt.deinit(self.allocator);
+            self.allocator.free(options);
+        }
+
+        for (choices, 0..) |choice, i| {
+            options[i] = .{
+                .id = try self.allocator.dupe(u8, choice.id),
+                .label = try self.allocator.dupe(u8, choice.label),
+                .submit_text = try self.allocator.dupe(u8, choice.submit_text),
+            };
+            built += 1;
+        }
+
+        return .{
+            .version = 1,
+            .options = options,
+        };
+    }
+
+    fn buildComponentsJson(
+        self: *DiscordChannel,
+        directive: interaction_choices.ChoicesDirective,
+        token: []const u8,
+    ) ![]u8 {
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(self.allocator);
+
+        try out.appendSlice(self.allocator, "[");
+        var row_start: usize = 0;
+        while (row_start < directive.options.len) {
+            if (row_start > 0) try out.appendSlice(self.allocator, ",");
+            try out.appendSlice(self.allocator, "{\"type\":1,\"components\":[");
+
+            const row_end = @min(row_start + 5, directive.options.len);
+            for (directive.options[row_start..row_end], row_start..) |opt, idx| {
+                if (idx > row_start) try out.appendSlice(self.allocator, ",");
+                var cb_buf: [100]u8 = undefined;
+                const custom_id = try interaction_choices.formatChoiceCallbackData(&cb_buf, token, opt.id, 100);
+                try out.appendSlice(self.allocator, "{\"type\":2,\"style\":1,\"label\":");
+                try root.json_util.appendJsonString(&out, self.allocator, opt.label);
+                try out.appendSlice(self.allocator, ",\"custom_id\":");
+                try root.json_util.appendJsonString(&out, self.allocator, custom_id);
+                try out.appendSlice(self.allocator, "}");
+            }
+            try out.appendSlice(self.allocator, "]}");
+            row_start = row_end;
+        }
+        try out.appendSlice(self.allocator, "]");
+        return try out.toOwnedSlice(self.allocator);
+    }
+
+    fn registerPendingInteraction(
+        self: *DiscordChannel,
+        token: []const u8,
+        chat_id: []const u8,
+        directive: interaction_choices.ChoicesDirective,
+    ) !void {
+        var options = try self.allocator.alloc(PendingInteractionOption, directive.options.len);
+        var built: usize = 0;
+        errdefer {
+            for (options[0..built]) |opt| opt.deinit(self.allocator);
+            self.allocator.free(options);
+        }
+
+        for (directive.options, 0..) |opt, i| {
+            options[i] = .{
+                .id = try self.allocator.dupe(u8, opt.id),
+                .label = try self.allocator.dupe(u8, opt.label),
+                .submit_text = try self.allocator.dupe(u8, opt.submit_text),
+            };
+            built += 1;
+        }
+
+        const key = try self.allocator.dupe(u8, token);
+        errdefer self.allocator.free(key);
+        const chat_copy = try self.allocator.dupe(u8, chat_id);
+        errdefer self.allocator.free(chat_copy);
+
+        const now_ms = std.time.milliTimestamp();
+        if (now_ms < 0) return error.InvalidTimestamp;
+        self.pruneExpiredInteractions();
+        self.interaction_mu.lock();
+        defer self.interaction_mu.unlock();
+        try self.pending_interactions.put(self.allocator, key, .{
+            .expires_at_ms = @as(u64, @intCast(now_ms)) + PENDING_INTERACTION_TTL_MS,
+            .chat_id = chat_copy,
+            .options = options,
+        });
+    }
+
+    fn pruneExpiredInteractions(self: *DiscordChannel) void {
+        const now_ms: i64 = std.time.milliTimestamp();
+        self.interaction_mu.lock();
+        defer self.interaction_mu.unlock();
+
+        var it = self.pending_interactions.iterator();
+        while (it.next()) |entry| {
+            if (entry.value_ptr.expires_at_ms <= @as(u64, @intCast(now_ms))) {
+                const key = entry.key_ptr.*;
+                if (self.pending_interactions.fetchRemove(key)) |kv| {
+                    self.allocator.free(@constCast(kv.key));
+                    kv.value.deinit(self.allocator);
+                }
+            }
+        }
+    }
+
+    const CallbackSelection = union(enum) {
+        ok: []u8,
+        not_found,
+        expired,
+        invalid_chat,
+        invalid_option,
+    };
+
+    fn consumeCallbackSelection(
+        self: *DiscordChannel,
+        allocator: std.mem.Allocator,
+        token: []const u8,
+        option_id: []const u8,
+        chat_id: []const u8,
+    ) !CallbackSelection {
+        self.pruneExpiredInteractions();
+        self.interaction_mu.lock();
+        defer self.interaction_mu.unlock();
+
+        const pending_ptr = self.pending_interactions.getPtr(token) orelse return .not_found;
+        if (pending_ptr.expires_at_ms <= @as(u64, @intCast(std.time.milliTimestamp()))) {
+            if (self.pending_interactions.fetchRemove(token)) |kv| {
+                self.allocator.free(@constCast(kv.key));
+                kv.value.deinit(self.allocator);
+            }
+            return .expired;
+        }
+        if (!std.mem.eql(u8, pending_ptr.chat_id, chat_id)) return .invalid_chat;
+
+        for (pending_ptr.options) |opt| {
+            if (!std.mem.eql(u8, opt.id, option_id)) continue;
+            const submit_text = try allocator.dupe(u8, opt.submit_text);
+            if (self.pending_interactions.fetchRemove(token)) |kv| {
+                self.allocator.free(@constCast(kv.key));
+                kv.value.deinit(self.allocator);
+            }
+            return .{ .ok = submit_text };
+        }
+        return .invalid_option;
+    }
+
+    fn deinitPendingInteractions(self: *DiscordChannel) void {
+        self.interaction_mu.lock();
+        var pending = self.pending_interactions;
+        self.pending_interactions = .empty;
+        self.interaction_mu.unlock();
+
+        var it = pending.iterator();
+        while (it.next()) |entry| {
+            self.allocator.free(@constCast(entry.key_ptr.*));
+            entry.value_ptr.deinit(self.allocator);
+        }
+        pending.deinit(self.allocator);
+    }
+
+    fn sendRichMessage(self: *DiscordChannel, channel_id: []const u8, payload: root.Channel.OutboundPayload) !void {
+        if (payload.attachments.len > 0) return error.NotSupported;
+        if (payload.choices.len == 0) return self.sendMessage(channel_id, payload.text);
+
+        var directive = try self.buildChoicesDirectiveFromPayload(payload.choices);
+        defer directive.deinit(self.allocator);
+
+        const token = try self.nextInteractionToken();
+        defer self.allocator.free(token);
+        const components_json = try self.buildComponentsJson(directive, token);
+        defer self.allocator.free(components_json);
+
+        var url_buf: [256]u8 = undefined;
+        const url = try sendUrl(&url_buf, channel_id);
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try body.appendSlice(self.allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&body, self.allocator, payload.text);
+        try body.appendSlice(self.allocator, ",\"components\":");
+        try body.appendSlice(self.allocator, components_json);
+        try body.appendSlice(self.allocator, "}");
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bot {s}", .{self.token});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, url, body.items, &.{auth_header}) catch |err| {
+            log.err("Discord API rich POST failed: {}", .{err});
+            return error.DiscordApiError;
+        };
+        defer self.allocator.free(resp);
+
+        try self.registerPendingInteraction(token, channel_id, directive);
+    }
+
+    fn editRichMessage(self: *DiscordChannel, edit: root.Channel.MessageEdit) !void {
+        if (edit.payload.attachments.len > 0) return error.NotSupported;
+
+        var components_json: ?[]u8 = null;
+        defer if (components_json) |json| self.allocator.free(json);
+
+        if (edit.payload.choices.len > 0) {
+            var directive = try self.buildChoicesDirectiveFromPayload(edit.payload.choices);
+            defer directive.deinit(self.allocator);
+
+            const token = try self.nextInteractionToken();
+            defer self.allocator.free(token);
+            components_json = try self.buildComponentsJson(directive, token);
+            try self.registerPendingInteraction(token, edit.target, directive);
+        }
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+        try body.appendSlice(self.allocator, "{\"content\":");
+        try root.json_util.appendJsonString(&body, self.allocator, edit.payload.text);
+        if (components_json) |json| {
+            try body.appendSlice(self.allocator, ",\"components\":");
+            try body.appendSlice(self.allocator, json);
+        } else {
+            try body.appendSlice(self.allocator, ",\"components\":[]");
+        }
+        try body.appendSlice(self.allocator, "}");
+
+        var url_buf: [256]u8 = undefined;
+        const url = try editMessageUrl(&url_buf, edit.target, edit.message_id);
+        try self.sendJsonMethod("PATCH", url, body.items);
+    }
+
+    fn answerInteraction(self: *DiscordChannel, interaction_id: []const u8, interaction_token: []const u8, message: ?[]const u8) void {
+        if (builtin.is_test) return;
+
+        var url_buf: [512]u8 = undefined;
+        const url = interactionCallbackUrl(&url_buf, interaction_id, interaction_token) catch return;
+
+        const body = if (message) |msg|
+            std.fmt.allocPrint(self.allocator, "{{\"type\":4,\"data\":{{\"content\":{f},\"flags\":64}}}}", .{std.json.fmt(msg, .{})})
+        else
+            self.allocator.dupe(u8, "{\"type\":6}");
+        const owned_body = body catch return;
+        defer self.allocator.free(owned_body);
+
+        const resp = root.http_util.curlPost(self.allocator, url, owned_body, &.{}) catch return;
+        self.allocator.free(resp);
+    }
+
     // ── Gateway ──────────────────────────────────────────────────────
 
     fn vtableStart(ptr: *anyopaque) anyerror!void {
@@ -378,6 +755,7 @@ pub const DiscordChannel = struct {
         self.running.store(false, .release);
         self.heartbeat_stop.store(true, .release);
         self.stopAllTyping();
+        self.deinitPendingInteractions();
         // Close socket to unblock blocking read
         const fd = self.ws_fd.load(.acquire);
         if (fd != invalid_socket) {
@@ -411,6 +789,16 @@ pub const DiscordChannel = struct {
         try self.sendMessage(target, message);
     }
 
+    fn vtableSendRich(ptr: *anyopaque, target: []const u8, payload: root.Channel.OutboundPayload) anyerror!void {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        try self.sendRichMessage(target, payload);
+    }
+
+    fn vtableEditMessage(ptr: *anyopaque, edit: root.Channel.MessageEdit) anyerror!void {
+        const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
+        try self.editRichMessage(edit);
+    }
+
     fn vtableName(ptr: *anyopaque) []const u8 {
         const self: *DiscordChannel = @ptrCast(@alignCast(ptr));
         return self.channelName();
@@ -435,6 +823,8 @@ pub const DiscordChannel = struct {
         .start = &vtableStart,
         .stop = &vtableStop,
         .send = &vtableSend,
+        .sendRich = &vtableSendRich,
+        .editMessage = &vtableEditMessage,
         .name = &vtableName,
         .healthCheck = &vtableHealthCheck,
         .startTyping = &vtableStartTyping,
@@ -647,6 +1037,10 @@ pub const DiscordChannel = struct {
                 } else if (std.mem.eql(u8, event_type, "MESSAGE_CREATE")) {
                     self.handleMessageCreate(root_val) catch |err| {
                         log.warn("Discord: handleMessageCreate error: {}", .{err});
+                    };
+                } else if (std.mem.eql(u8, event_type, "INTERACTION_CREATE")) {
+                    self.handleInteractionCreate(root_val) catch |err| {
+                        log.warn("Discord: handleInteractionCreate error: {}", .{err});
                     };
                 }
             },
@@ -977,6 +1371,163 @@ pub const DiscordChannel = struct {
         }
     }
 
+    fn handleInteractionCreate(self: *DiscordChannel, root_val: std.json.Value) !void {
+        if (root_val != .object) return;
+        const d_val = root_val.object.get("d") orelse return;
+        const d_obj = switch (d_val) {
+            .object => |o| o,
+            else => return,
+        };
+
+        const interaction_id = if (d_obj.get("id")) |v| switch (v) {
+            .string => |s| s,
+            else => return,
+        } else return;
+        const interaction_token = if (d_obj.get("token")) |v| switch (v) {
+            .string => |s| s,
+            else => return,
+        } else return;
+        const channel_id = if (d_obj.get("channel_id")) |v| switch (v) {
+            .string => |s| s,
+            else => return,
+        } else return;
+        const interaction_message_id: ?[]const u8 = if (d_obj.get("message")) |v| switch (v) {
+            .object => |msg_obj| if (msg_obj.get("id")) |id_val| switch (id_val) {
+                .string => |s| s,
+                else => null,
+            } else null,
+            else => null,
+        } else null;
+        const guild_id: ?[]const u8 = if (d_obj.get("guild_id")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        const data_val = d_obj.get("data") orelse {
+            self.answerInteraction(interaction_id, interaction_token, "Unsupported interaction");
+            return;
+        };
+        const data_obj = switch (data_val) {
+            .object => |o| o,
+            else => {
+                self.answerInteraction(interaction_id, interaction_token, "Unsupported interaction");
+                return;
+            },
+        };
+        const custom_id = if (data_obj.get("custom_id")) |v| switch (v) {
+            .string => |s| s,
+            else => {
+                self.answerInteraction(interaction_id, interaction_token, "Unsupported button");
+                return;
+            },
+        } else {
+            self.answerInteraction(interaction_id, interaction_token, "Unsupported button");
+            return;
+        };
+        const parsed_cb = interaction_choices.parseChoiceCallbackData(custom_id) orelse {
+            self.answerInteraction(interaction_id, interaction_token, "Unsupported button");
+            return;
+        };
+
+        const member_user_obj = if (d_obj.get("member")) |member_val| switch (member_val) {
+            .object => |member_obj| if (member_obj.get("user")) |uval| switch (uval) {
+                .object => |uobj| uobj,
+                else => null,
+            } else null,
+            else => null,
+        } else null;
+        const direct_user_obj = if (d_obj.get("user")) |user_val| switch (user_val) {
+            .object => |uobj| uobj,
+            else => null,
+        } else null;
+        const user_obj = member_user_obj orelse direct_user_obj orelse {
+            self.answerInteraction(interaction_id, interaction_token, "Missing user context");
+            return;
+        };
+
+        const user_id = if (user_obj.get("id")) |v| switch (v) {
+            .string => |s| s,
+            else => return,
+        } else return;
+        const username: ?[]const u8 = if (user_obj.get("username")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+        const display_name: ?[]const u8 = if (user_obj.get("global_name")) |v| switch (v) {
+            .string => |s| s,
+            else => null,
+        } else null;
+
+        if (self.allow_from.len > 0 and !root.isAllowedScoped("discord channel", self.allow_from, user_id)) {
+            self.answerInteraction(interaction_id, interaction_token, "You are not allowed to use this button");
+            return;
+        }
+
+        const selection = try self.consumeCallbackSelection(self.allocator, parsed_cb.token, parsed_cb.option_id, channel_id);
+        switch (selection) {
+            .ok => |submit_text| {
+                defer self.allocator.free(submit_text);
+                self.answerInteraction(interaction_id, interaction_token, null);
+
+                const session_key = if (guild_id == null)
+                    try std.fmt.allocPrint(self.allocator, "discord:{s}:direct:{s}", .{ self.account_id, user_id })
+                else
+                    try std.fmt.allocPrint(self.allocator, "discord:{s}:channel:{s}", .{ self.account_id, channel_id });
+                defer self.allocator.free(session_key);
+
+                var metadata_buf: std.ArrayListUnmanaged(u8) = .empty;
+                defer metadata_buf.deinit(self.allocator);
+                const mw = metadata_buf.writer(self.allocator);
+                try mw.print("{{\"is_dm\":{s}", .{if (guild_id == null) "true" else "false"});
+                try mw.writeAll(",\"account_id\":");
+                try root.appendJsonStringW(mw, self.account_id);
+                try mw.writeAll(",\"interaction\":\"button\"");
+                if (std.mem.startsWith(u8, submit_text, "/model ")) {
+                    try mw.writeAll(",\"replace_message\":true");
+                }
+                if (interaction_message_id) |message_id| {
+                    try mw.writeAll(",\"message_id\":");
+                    try root.appendJsonStringW(mw, message_id);
+                }
+                if (guild_id) |gid| {
+                    try mw.writeAll(",\"guild_id\":");
+                    try root.appendJsonStringW(mw, gid);
+                }
+                if (username) |uname| {
+                    try mw.writeAll(",\"sender_username\":");
+                    try root.appendJsonStringW(mw, uname);
+                }
+                if (display_name) |dname| {
+                    try mw.writeAll(",\"sender_display_name\":");
+                    try root.appendJsonStringW(mw, dname);
+                }
+                try mw.writeByte('}');
+
+                const msg = try bus_mod.makeInboundFull(
+                    self.allocator,
+                    "discord",
+                    user_id,
+                    channel_id,
+                    submit_text,
+                    session_key,
+                    &.{},
+                    metadata_buf.items,
+                );
+                if (self.bus) |b| {
+                    b.publishInbound(msg) catch |err| {
+                        log.warn("Discord: failed to publish interaction message: {}", .{err});
+                        msg.deinit(self.allocator);
+                    };
+                } else {
+                    msg.deinit(self.allocator);
+                }
+            },
+            .not_found, .expired => self.answerInteraction(interaction_id, interaction_token, "This menu has expired"),
+            .invalid_chat => self.answerInteraction(interaction_id, interaction_token, "This button belongs to another chat"),
+            .invalid_option => self.answerInteraction(interaction_id, interaction_token, "Unknown button selection"),
+        }
+    }
+
     /// Send IDENTIFY payload.
     fn sendIdentifyPayload(self: *DiscordChannel, ws: *websocket.WsClient) !void {
         var buf: [1024]u8 = undefined;
@@ -1186,6 +1737,29 @@ test "discord initFromConfig passes all fields" {
     try std.testing.expectEqual(@as(u32, 512), ch.intents);
 }
 
+test "discord buildComponentsJson packs sixth option into final row" {
+    const alloc = std.testing.allocator;
+    var ch = DiscordChannel.init(alloc, "token", null, false);
+
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "m1", .label = "One", .submit_text = "/model one" },
+        .{ .id = "m2", .label = "Two", .submit_text = "/model two" },
+        .{ .id = "m3", .label = "Three", .submit_text = "/model three" },
+        .{ .id = "m4", .label = "Four", .submit_text = "/model four" },
+        .{ .id = "prev", .label = "Prev", .submit_text = "/model page 1" },
+        .{ .id = "next", .label = "Next", .submit_text = "/model page 3" },
+    };
+    var directive = try ch.buildChoicesDirectiveFromPayload(&choices);
+    defer directive.deinit(alloc);
+
+    const json = try ch.buildComponentsJson(directive, "abc");
+    defer alloc.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"custom_id\":\"nc1:abc:m1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"custom_id\":\"nc1:abc:prev\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"custom_id\":\"nc1:abc:next\"") != null);
+}
+
 test "discord handleMessageCreate publishes inbound guild message with metadata" {
     const alloc = std.testing.allocator;
     var event_bus = bus_mod.Bus.init();
@@ -1227,6 +1801,45 @@ test "discord handleMessageCreate publishes inbound guild message with metadata"
     try std.testing.expectEqualStrings("g-1", meta.value.object.get("guild_id").?.string);
     try std.testing.expectEqualStrings("discord-user", meta.value.object.get("sender_username").?.string);
     try std.testing.expectEqualStrings("Discord User", meta.value.object.get("sender_display_name").?.string);
+}
+
+test "discord handleInteractionCreate publishes synthetic inbound command" {
+    const alloc = std.testing.allocator;
+    var event_bus = bus_mod.Bus.init();
+    defer event_bus.close();
+
+    var ch = DiscordChannel.initFromConfig(alloc, .{
+        .account_id = "dc-main",
+        .token = "token",
+    });
+    ch.setBus(&event_bus);
+    defer ch.deinitPendingInteractions();
+
+    const choices = [_]root.Channel.OutboundChoice{
+        .{ .id = "m1", .label = "Alpha", .submit_text = "/model alpha" },
+        .{ .id = "next", .label = "Next", .submit_text = "/model page 2" },
+    };
+    var directive = try ch.buildChoicesDirectiveFromPayload(&choices);
+    defer directive.deinit(alloc);
+    try ch.registerPendingInteraction("tok1", "c-9", directive);
+
+    const interaction_json =
+        \\{"d":{"id":"i-1","token":"itok","channel_id":"c-9","guild_id":"g-9","member":{"user":{"id":"u-9","username":"discord-user","global_name":"Discord User"}},"data":{"custom_id":"nc1:tok1:m1"}}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, alloc, interaction_json, .{});
+    defer parsed.deinit();
+
+    try ch.handleInteractionCreate(parsed.value);
+
+    var msg = event_bus.consumeInbound() orelse return try std.testing.expect(false);
+    defer msg.deinit(alloc);
+    try std.testing.expectEqualStrings("discord", msg.channel);
+    try std.testing.expectEqualStrings("u-9", msg.sender_id);
+    try std.testing.expectEqualStrings("c-9", msg.chat_id);
+    try std.testing.expectEqualStrings("/model alpha", msg.content);
+    try std.testing.expectEqualStrings("discord:dc-main:channel:c-9", msg.session_key);
+    try std.testing.expect(msg.metadata_json != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg.metadata_json.?, "\"interaction\":\"button\"") != null);
 }
 
 test "discord handleMessageCreate sets is_dm metadata for direct messages" {
