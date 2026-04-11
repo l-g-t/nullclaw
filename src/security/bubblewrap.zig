@@ -71,8 +71,40 @@ pub const BubblewrapSandbox = struct {
 
     fn isAvailable(_: *anyopaque) bool {
         if (comptime builtin.os.tag != .linux) return false;
+        return probeCommand(&.{
+            "bwrap",
+            "--ro-bind",
+            "/usr",
+            "/usr",
+            "--ro-bind-try",
+            "/bin",
+            "/bin",
+            "--ro-bind-try",
+            "/lib",
+            "/lib",
+            "--ro-bind-try",
+            "/lib64",
+            "/lib64",
+            "--dev",
+            "/dev",
+            "--proc",
+            "/proc",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        });
+    }
 
-        var child = std.process.Child.init(&.{ "bwrap", "--version" }, std.heap.page_allocator);
+    fn getName(_: *anyopaque) []const u8 {
+        return "bubblewrap";
+    }
+
+    fn getDescription(_: *anyopaque) []const u8 {
+        return "User namespace sandbox (requires bwrap)";
+    }
+
+    fn probeCommand(argv: []const []const u8) bool {
+        var child = std.process.Child.init(argv, std.heap.page_allocator);
         child.stderr_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stdin_behavior = .Ignore;
@@ -82,14 +114,6 @@ pub const BubblewrapSandbox = struct {
             .Exited => |code| code == 0,
             else => false,
         };
-    }
-
-    fn getName(_: *anyopaque) []const u8 {
-        return "bubblewrap";
-    }
-
-    fn getDescription(_: *anyopaque) []const u8 {
-        return "User namespace sandbox (requires bwrap)";
     }
 };
 
@@ -223,4 +247,10 @@ test "bubblewrap sandbox availability requires executable in PATH" {
     defer std.testing.allocator.free(empty_z);
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, empty_z.ptr, 1));
     try std.testing.expect(!sb.isAvailable());
+}
+
+test "bubblewrap probeCommand reports child exit status" {
+    if (comptime builtin.os.tag != .linux) return;
+    try std.testing.expect(BubblewrapSandbox.probeCommand(&.{ "/bin/sh", "-c", "exit 0" }));
+    try std.testing.expect(!BubblewrapSandbox.probeCommand(&.{ "/bin/sh", "-c", "exit 9" }));
 }

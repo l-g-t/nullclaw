@@ -47,8 +47,19 @@ pub const FirejailSandbox = struct {
 
     fn isAvailable(_: *anyopaque) bool {
         if (comptime builtin.os.tag != .linux) return false;
+        return probeCommand(&.{ "firejail", "--quiet", "--noprofile", "--net=none", "/bin/sh", "-c", "exit 0" });
+    }
 
-        var child = std.process.Child.init(&.{ "firejail", "--version" }, std.heap.page_allocator);
+    fn getName(_: *anyopaque) []const u8 {
+        return "firejail";
+    }
+
+    fn getDescription(_: *anyopaque) []const u8 {
+        return "Linux user-space sandbox (requires firejail to be installed)";
+    }
+
+    fn probeCommand(argv: []const []const u8) bool {
+        var child = std.process.Child.init(argv, std.heap.page_allocator);
         child.stderr_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stdin_behavior = .Ignore;
@@ -58,14 +69,6 @@ pub const FirejailSandbox = struct {
             .Exited => |code| code == 0,
             else => false,
         };
-    }
-
-    fn getName(_: *anyopaque) []const u8 {
-        return "firejail";
-    }
-
-    fn getDescription(_: *anyopaque) []const u8 {
-        return "Linux user-space sandbox (requires firejail to be installed)";
     }
 };
 
@@ -177,4 +180,10 @@ test "firejail sandbox availability requires executable in PATH" {
     defer std.testing.allocator.free(empty_z);
     try std.testing.expectEqual(@as(c_int, 0), c.setenv(key_z.ptr, empty_z.ptr, 1));
     try std.testing.expect(!sb.isAvailable());
+}
+
+test "firejail probeCommand reports child exit status" {
+    if (comptime builtin.os.tag != .linux) return;
+    try std.testing.expect(FirejailSandbox.probeCommand(&.{ "/bin/sh", "-c", "exit 0" }));
+    try std.testing.expect(!FirejailSandbox.probeCommand(&.{ "/bin/sh", "-c", "exit 7" }));
 }
