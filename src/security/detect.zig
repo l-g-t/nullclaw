@@ -5,7 +5,9 @@ const NoopSandbox = @import("sandbox.zig").NoopSandbox;
 const LandlockSandbox = @import("landlock.zig").LandlockSandbox;
 const FirejailSandbox = @import("firejail.zig").FirejailSandbox;
 const BubblewrapSandbox = @import("bubblewrap.zig").BubblewrapSandbox;
-const DockerSandbox = @import("docker.zig").DockerSandbox;
+const docker = @import("docker.zig");
+const DockerSandbox = docker.DockerSandbox;
+const createDockerSandbox = docker.createDockerSandbox;
 
 /// Sandbox backend preference.
 pub const SandboxBackend = enum {
@@ -60,7 +62,7 @@ pub fn createSandbox(
             return storage.noop.sandbox();
         },
         .docker => {
-            storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+            storage.docker = createDockerSandbox(allocator, workspace_dir, null);
             return storage.docker.sandbox();
         },
         .auto => {
@@ -101,7 +103,7 @@ fn detectBest(allocator: std.mem.Allocator, workspace_dir: []const u8, storage: 
     }
 
     // Docker works on any platform if installed
-    storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+    storage.docker = createDockerSandbox(allocator, workspace_dir, null);
     if (storage.docker.sandbox().isAvailable()) {
         return storage.docker.sandbox();
     }
@@ -132,7 +134,7 @@ pub fn detectAvailable(allocator: std.mem.Allocator, workspace_dir: []const u8) 
     storage.bubblewrap = .{ .workspace_dir = workspace_dir };
     const bw_avail = storage.bubblewrap.sandbox().isAvailable();
 
-    storage.docker = .{ .allocator = allocator, .workspace_dir = workspace_dir, .image = DockerSandbox.default_image };
+    storage.docker = createDockerSandbox(allocator, workspace_dir, null);
     const dk_avail = storage.docker.sandbox().isAvailable();
 
     return .{
@@ -182,6 +184,15 @@ test "create sandbox with docker returns docker" {
     var storage: SandboxStorage = .{};
     const sb = createSandbox(std.testing.allocator, .docker, "/tmp/workspace", &storage);
     try std.testing.expectEqualStrings("docker", sb.name());
+}
+
+test "create sandbox with docker prebuilds mount arg" {
+    var storage: SandboxStorage = .{};
+    _ = createSandbox(std.testing.allocator, .docker, "/tmp/workspace", &storage);
+
+    // Regression: detect.zig must use the Docker sandbox factory so wrapCommand
+    // never passes an empty -v argument to docker.
+    try std.testing.expectEqualStrings("/tmp/workspace:/tmp/workspace", storage.docker.mount_arg_buf[0..storage.docker.mount_arg_len]);
 }
 
 test "sandbox storage default initialization" {

@@ -38,6 +38,7 @@ pub const DockerSandbox = struct {
 
     fn wrapCommand(ptr: *anyopaque, argv: []const []const u8, buf: [][]const u8) anyerror![]const []const u8 {
         const self = resolve(ptr);
+        if (self.workspace_dir.len == 0 or self.mount_arg_len == 0) return error.EmptyWorkspaceDir;
         // docker run --rm --memory 512m --cpus 1.0 --network none -v WORKSPACE:WORKSPACE -w WORKSPACE IMAGE <argv...>
         const prefix = [_][]const u8{
             "docker",   "run",       "--rm",
@@ -326,6 +327,20 @@ test "docker buffer too small returns error" {
     var buf: [5][]const u8 = undefined;
     const result = sb.wrapCommand(&argv, &buf);
     try std.testing.expectError(error.BufferTooSmall, result);
+}
+
+test "docker wrap rejects empty workspace state" {
+    var dk = DockerSandbox{
+        .allocator = std.testing.allocator,
+        .workspace_dir = "",
+        .image = DockerSandbox.default_image,
+    };
+    const sb = dk.sandbox();
+
+    const argv = [_][]const u8{"echo"};
+    var buf: [16][]const u8 = undefined;
+    const result = sb.wrapCommand(&argv, &buf);
+    try std.testing.expectError(error.EmptyWorkspaceDir, result);
 }
 
 test "docker sandbox workspace is mounted correctly" {
