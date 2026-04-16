@@ -6,7 +6,7 @@
 //!   - Body size limits (configurable, default 64KB)
 //!   - Request timeouts (configurable, default 30s)
 //!   - Bearer token authentication (PairingGuard)
-//!   - Endpoints: /health, /ready, /pair, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
+//!   - Endpoints: /health, /ready, /pair, /logout, /webhook, /a2a, /.well-known/agent-card.json, /whatsapp, /telegram, /line, /lark, /wechat, /wecom, /qq, /max, /slack/events, /api/messages (Teams)
 //!
 //! Uses std.http.Server (built-in, no external deps).
 
@@ -701,9 +701,23 @@ pub fn isWebhookAuthorized(pairing_guard: ?*const PairingGuard, bearer_token: ?[
     return guard.isAuthenticated(token);
 }
 
+/// Revoke a currently authenticated bearer token. Returns false when pairing is
+/// unavailable, disabled, or the token is missing/invalid.
+pub fn revokeAuthorizedBearerToken(pairing_guard: ?*PairingGuard, bearer_token: ?[]const u8) bool {
+    const guard = pairing_guard orelse return false;
+    if (!guard.requirePairing()) return false;
+    const token = bearer_token orelse return false;
+    if (!guard.isAuthenticated(token)) return false;
+    return guard.revokeToken(token);
+}
+
 /// Format the /pair success payload. Returns null when buffer is too small.
-pub fn formatPairSuccessResponse(buf: []u8, token: []const u8) ?[]const u8 {
-    return std.fmt.bufPrint(buf, "{{\"status\":\"paired\",\"token\":\"{s}\"}}", .{token}) catch null;
+pub fn formatPairSuccessResponse(buf: []u8, token: []const u8, expires_in_secs: u32) ?[]const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "{{\"status\":\"paired\",\"token\":\"{s}\",\"expires_in\":{d}}}",
+        .{ token, expires_in_secs },
+    ) catch null;
 }
 
 fn asciiEqlIgnoreCase(a: []const u8, b: []const u8) bool {
@@ -4946,7 +4960,7 @@ pub fn clearSharedScheduler() void {
 }
 
 /// Run the HTTP gateway. Binds to host:port and serves HTTP requests.
-/// Endpoints: GET /health, GET /ready, POST /pair, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
+/// Endpoints: GET /health, GET /ready, POST /pair, POST /logout, POST /webhook, GET|POST /whatsapp, POST /telegram, POST /slack/events, POST /line, POST /lark, GET|POST /wechat, GET|POST /wecom, POST /qq, POST /max
 /// If config_ptr is null, loads config internally (for backward compatibility).
 pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr: ?*const Config, event_bus: ?*bus_mod.Bus) !void {
     health.markComponentOk("gateway");
@@ -5238,12 +5252,13 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
         const target = parts.next() orelse continue;
 
         // Simple routing — control endpoints + descriptor-driven channel webhooks.
-        const ControlRoute = enum { health, ready, webhook, pair };
+        const ControlRoute = enum { health, ready, webhook, pair, logout };
         const control_route_map = std.StaticStringMap(ControlRoute).initComptime(.{
             .{ "/health", .health },
             .{ "/ready", .ready },
             .{ "/webhook", .webhook },
             .{ "/pair", .pair },
+            .{ "/logout", .logout },
         });
         const base_path = if (std.mem.indexOfScalar(u8, target, '?')) |qi| target[0..qi] else target;
         const is_post = std.mem.eql(u8, method_str, "POST");
@@ -5476,7 +5491,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                         switch (guard.attemptPair(pairing_code)) {
                             .paired => |token| {
                                 defer allocator.free(token);
-                                if (formatPairSuccessResponse(&pair_response_buf, token)) |pair_resp| {
+                                if (formatPairSuccessResponse(&pair_response_buf, token, guard.tokenExpiresInSecs())) |pair_resp| {
                                     response_body = pair_resp;
                                 } else {
                                     response_status = "500 Internal Server Error";
@@ -5511,6 +5526,22 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     } else {
                         response_status = "500 Internal Server Error";
                         response_body = "{\"error\":\"pairing unavailable\"}";
+                    }
+                }
+            },
+            .logout => {
+                if (!is_post) {
+                    response_status = "405 Method Not Allowed";
+                    response_body = "{\"error\":\"method not allowed\"}";
+                } else {
+                    const auth_header = extractHeader(raw, "Authorization");
+                    const bearer = if (auth_header) |ah| extractBearerToken(ah) else null;
+                    const pairing_guard = if (state.pairing_guard) |*guard| guard else null;
+                    if (!revokeAuthorizedBearerToken(pairing_guard, bearer)) {
+                        response_status = "401 Unauthorized";
+                        response_body = "{\"error\":\"unauthorized\"}";
+                    } else {
+                        response_body = "{\"status\":\"revoked\"}";
                     }
                 }
             },
@@ -6196,18 +6227,37 @@ test "isWebhookAuthorized requires valid bearer token when pairing enabled" {
     try std.testing.expect(!isWebhookAuthorized(&guard, "zc_invalid"));
 }
 
+test "revokeAuthorizedBearerToken removes authenticated token" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(revokeAuthorizedBearerToken(&guard, "zc_valid"));
+    try std.testing.expect(!guard.isAuthenticated("zc_valid"));
+}
+
+test "revokeAuthorizedBearerToken rejects missing or invalid tokens" {
+    const tokens = [_][]const u8{"zc_valid"};
+    var guard = try PairingGuard.init(std.testing.allocator, true, &tokens);
+    defer guard.deinit();
+
+    try std.testing.expect(!revokeAuthorizedBearerToken(&guard, null));
+    try std.testing.expect(!revokeAuthorizedBearerToken(&guard, "zc_invalid"));
+    try std.testing.expect(guard.isAuthenticated("zc_valid"));
+}
+
 test "formatPairSuccessResponse includes paired token" {
     var buf: [256]u8 = undefined;
-    const response = formatPairSuccessResponse(&buf, "zc_token_123") orelse unreachable;
+    const response = formatPairSuccessResponse(&buf, "zc_token_123", 3600) orelse unreachable;
     try std.testing.expectEqualStrings(
-        "{\"status\":\"paired\",\"token\":\"zc_token_123\"}",
+        "{\"status\":\"paired\",\"token\":\"zc_token_123\",\"expires_in\":3600}",
         response,
     );
 }
 
 test "formatPairSuccessResponse fails when buffer is too small" {
     var buf: [8]u8 = undefined;
-    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123") == null);
+    try std.testing.expect(formatPairSuccessResponse(&buf, "zc_token_123", 3600) == null);
 }
 
 // ── extractHeader tests ──────────────────────────────────────────

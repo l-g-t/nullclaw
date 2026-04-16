@@ -218,6 +218,13 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
     return s;
 }
 
+fn validatedBaseUrl(base_url: ?[]const u8) ?[]const u8 {
+    if (base_url) |url| {
+        if (config_types.ProviderEntry.isValidBaseUrl(url)) return url;
+    }
+    return null;
+}
+
 fn normalizeAzureBaseUrlOwned(allocator: std.mem.Allocator, base_url: ?[]const u8) ![]u8 {
     const raw = trimTrailingSlash(base_url orelse AZURE_DEFAULT_BASE_URL);
 
@@ -385,13 +392,16 @@ pub const ProviderHolder = union(enum) {
                 allocator,
                 api_key,
                 if (std.mem.startsWith(u8, provider_name, "anthropic-custom:"))
-                    provider_name["anthropic-custom:".len..]
+                    if (config_types.ProviderEntry.isValidBaseUrl(provider_name["anthropic-custom:".len..]))
+                        provider_name["anthropic-custom:".len..]
+                    else
+                        validatedBaseUrl(base_url)
                 else
-                    base_url,
+                    validatedBaseUrl(base_url),
             ) },
             .openai_provider => .{ .openai = openai.OpenAiProvider.init(allocator, api_key, user_agent, extra_body_params) },
             .azure_openai_provider => blk: {
-                const azure_url = normalizeAzureBaseUrlOwned(allocator, base_url) catch null;
+                const azure_url = normalizeAzureBaseUrlOwned(allocator, validatedBaseUrl(base_url)) catch null;
                 var prov = compatible.OpenAiCompatibleProvider.init(
                     allocator,
                     provider_name,
@@ -412,17 +422,18 @@ pub const ProviderHolder = union(enum) {
                 break :blk .{ .compatible = prov };
             },
             .gemini_provider => .{ .gemini = gemini.GeminiProvider.init(allocator, api_key) },
-            .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, base_url) },
+            .vertex_provider => .{ .vertex = vertex.VertexProvider.init(allocator, api_key, validatedBaseUrl(base_url)) },
             .ollama_provider => blk: {
-                var prov = ollama.OllamaProvider.init(allocator, base_url, api_key);
+                var prov = ollama.OllamaProvider.init(allocator, validatedBaseUrl(base_url), api_key);
                 prov.native_tools = native_tools;
                 break :blk .{ .ollama = prov };
             },
             .openrouter_provider => .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key, extra_body_params) },
             .compatible_provider => blk: {
                 // Config base_url overrides built-in URL table and custom: prefix
-                const url = base_url orelse
-                    if (std.mem.startsWith(u8, provider_name, "custom:"))
+                const url = validatedBaseUrl(base_url) orelse
+                    if (std.mem.startsWith(u8, provider_name, "custom:") and
+                        config_types.ProviderEntry.isValidBaseUrl(provider_name["custom:".len..]))
                         provider_name["custom:".len..]
                     else
                         compatibleProviderUrl(provider_name) orelse "https://openrouter.ai/api/v1";
@@ -479,7 +490,7 @@ pub const ProviderHolder = union(enum) {
             .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
-            .unknown => if (base_url) |url| blk: {
+            .unknown => if (validatedBaseUrl(base_url)) |url| blk: {
                 var prov = compatible.OpenAiCompatibleProvider.init(
                     allocator,
                     provider_name,
@@ -880,6 +891,14 @@ test "fromConfig applies chat_template enable_thinking override for custom provi
     defer h.deinit();
     try std.testing.expect(h == .compatible);
     try std.testing.expect(h.compatible.chat_template_enable_thinking_param);
+}
+
+test "fromConfig ignores remote http base_url overrides" {
+    const alloc = std.testing.allocator;
+    var h = ProviderHolder.fromConfig(alloc, "groq", "key", "http://api.example.com/v1", true, null, null, false, null);
+    defer h.deinit();
+    try std.testing.expect(h == .compatible);
+    try std.testing.expectEqualStrings("https://api.groq.com/openai/v1", h.compatible.base_url);
 }
 
 test "fromConfig applies reasoning_split_param for MiniMax" {

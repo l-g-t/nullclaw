@@ -371,7 +371,7 @@ fn codexStreamRequest(
     ctx: *anyopaque,
 ) !StreamChatResult {
     // Build argv on stack
-    var argv_buf: [32][]const u8 = undefined;
+    var argv_buf: [36][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -403,6 +403,10 @@ fn codexStreamRequest(
         argv_buf[argc] = p;
         argc += 1;
     }
+
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     for (extra_headers) |hdr| {
         argv_buf[argc] = "-H";

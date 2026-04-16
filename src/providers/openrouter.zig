@@ -3,6 +3,7 @@ const std_compat = @import("compat");
 const root = @import("root.zig");
 const sse = @import("sse.zig");
 const error_classify = @import("error_classify.zig");
+const http_util = @import("../http_util.zig");
 
 const Provider = root.Provider;
 const ChatMessage = root.ChatMessage;
@@ -592,29 +593,16 @@ fn appendOpenRouterRequestFields(
 
 /// HTTP GET via curl subprocess with auth header.
 fn curlGet(allocator: std.mem.Allocator, url: []const u8, auth_hdr: []const u8) ![]u8 {
-    var child = std_compat.process.Child.init(&.{
-        "curl", "-s", "-H", auth_hdr, url,
-    }, allocator);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
+    const resolve_entry = http_util.buildSafeResolveEntryForRemoteUrl(allocator, url) catch |err| switch (err) {
+        error.InvalidUrl, error.LocalAddressBlocked, error.HostResolutionFailed => return err,
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer if (resolve_entry) |entry| allocator.free(entry);
 
-    try child.spawn();
-
-    const stdout = child.stdout.?.readToEndAlloc(allocator, 1024 * 1024) catch return error.CurlReadError;
-
-    const term = child.wait() catch return error.CurlWaitError;
-    switch (term) {
-        .exited => |code| if (code != 0) {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
-        else => {
-            allocator.free(stdout);
-            return error.CurlFailed;
-        },
+    if (resolve_entry) |entry| {
+        return http_util.curlGetWithResolve(allocator, url, &.{auth_hdr}, "15", entry);
     }
-
-    return stdout;
+    return http_util.curlGet(allocator, url, &.{auth_hdr}, "15");
 }
 
 // ════════════════════════════════════════════════════════════════════════════

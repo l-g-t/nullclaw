@@ -613,6 +613,12 @@ fn curlPostOAuth(allocator: std.mem.Allocator, url: []const u8, body: []const u8
         try argv.appendSlice(allocator, &.{ "--proxy", p });
     }
 
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    if (resolve_entry) |entry| {
+        try argv.appendSlice(allocator, &.{ "--resolve", entry });
+    }
+
     try argv.appendSlice(allocator, &.{
         "-H", "Content-Type: application/json",   "-H",            auth_hdr,
         "-H", version_hdr,                        "-H",            "anthropic-beta: oauth-2025-04-20",

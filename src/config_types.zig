@@ -90,6 +90,25 @@ pub const ProviderEntry = struct {
     /// request bodies for OpenAI-compatible providers. The encoded value must
     /// be a JSON object.
     extra_body_params: ?[]const u8 = null,
+
+    /// Provider base URLs must be absolute http(s) URLs with no query/fragment.
+    /// Plain HTTP is accepted only for local/private hosts so intentional
+    /// loopback and LAN providers keep working.
+    pub fn isValidBaseUrl(raw: []const u8) bool {
+        const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+        if (trimmed.len == 0) return false;
+        if (std.mem.indexOfAny(u8, trimmed, " \t\r\n?#") != null) return false;
+
+        const uri = std.Uri.parse(trimmed) catch return false;
+        if (uri.query != null or uri.fragment != null) return false;
+        const is_https = std.ascii.eqlIgnoreCase(uri.scheme, "https");
+        const is_http = std.ascii.eqlIgnoreCase(uri.scheme, "http");
+        if (!is_https and !is_http) return false;
+
+        const host = net_security.extractHost(trimmed) orelse return false;
+        if (is_http and !net_security.isLocalHost(host)) return false;
+        return true;
+    }
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────
@@ -1905,6 +1924,16 @@ test "HttpRequestConfig proxy URL validation" {
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://:8080"));
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com/path"));
     try std.testing.expect(!HttpRequestConfig.isValidProxyUrl("http://proxy.example.com?x=1"));
+}
+
+test "ProviderEntry base URL validation keeps local providers and rejects remote http" {
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("https://api.example.com/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://localhost:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://127.0.0.1:1234/v1"));
+    try std.testing.expect(ProviderEntry.isValidBaseUrl("http://192.168.1.10:1234/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("http://api.example.com/v1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("https://api.example.com/v1?x=1"));
+    try std.testing.expect(!ProviderEntry.isValidBaseUrl("ftp://api.example.com/v1"));
 }
 
 test "WebConfig normalizePath trims and normalizes" {

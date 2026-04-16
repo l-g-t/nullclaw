@@ -773,8 +773,8 @@ pub const GeminiProvider = struct {
         callback: root.StreamCallback,
         ctx: *anyopaque,
     ) !root.StreamChatResult {
-        // Build argv on stack (max 32 args)
-        var argv_buf: [32][]const u8 = undefined;
+        // Build argv on stack (max 36 args)
+        var argv_buf: [36][]const u8 = undefined;
         var argc: usize = 0;
 
         argv_buf[argc] = "curl";
@@ -818,6 +818,10 @@ pub const GeminiProvider = struct {
             argv_buf[argc] = p;
             argc += 1;
         }
+
+        const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+        defer if (resolve_entry) |entry| allocator.free(entry);
+        http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
         for (headers) |hdr| {
             argv_buf[argc] = "-H";

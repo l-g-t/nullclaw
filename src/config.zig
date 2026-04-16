@@ -1367,6 +1367,7 @@ pub const Config = struct {
         InvalidHttpSearchProvider,
         InvalidHttpSearchFallbackProvider,
         InvalidProviderApiMode,
+        InvalidProviderBaseUrl,
         InvalidMcpTransport,
         MissingMcpCommand,
         MissingMcpHttpUrl,
@@ -1404,6 +1405,17 @@ pub const Config = struct {
         }
         if (self.default_provider.len == 0) {
             return ValidationError.InvalidDefaultModelPrimary;
+        }
+        if (std.mem.startsWith(u8, self.default_provider, "custom:")) {
+            const custom_target = self.default_provider["custom:".len..];
+            if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                return ValidationError.InvalidProviderBaseUrl;
+            }
+        } else if (std.mem.startsWith(u8, self.default_provider, "anthropic-custom:")) {
+            const custom_target = self.default_provider["anthropic-custom:".len..];
+            if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                return ValidationError.InvalidProviderBaseUrl;
+            }
         }
         if (self.default_model == null) {
             return ValidationError.NoDefaultModel;
@@ -1460,6 +1472,22 @@ pub const Config = struct {
         for (self.providers) |provider| {
             if (provider.api_mode == .invalid) {
                 return ValidationError.InvalidProviderApiMode;
+            }
+            if (provider.base_url) |base_url| {
+                if (!config_types.ProviderEntry.isValidBaseUrl(base_url)) {
+                    return ValidationError.InvalidProviderBaseUrl;
+                }
+            }
+            if (std.mem.startsWith(u8, provider.name, "custom:")) {
+                const custom_target = provider.name["custom:".len..];
+                if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                    return ValidationError.InvalidProviderBaseUrl;
+                }
+            } else if (std.mem.startsWith(u8, provider.name, "anthropic-custom:")) {
+                const custom_target = provider.name["anthropic-custom:".len..];
+                if (!config_types.ProviderEntry.isValidBaseUrl(custom_target)) {
+                    return ValidationError.InvalidProviderBaseUrl;
+                }
             }
         }
         for (self.http_request.search_fallback_providers) |provider| {
@@ -1592,6 +1620,7 @@ pub const Config = struct {
             ValidationError.InvalidHttpSearchProvider => std.debug.print("Config error: http_request.search_provider must be one of: auto, searxng, duckduckgo(ddg), brave, firecrawl, tavily, perplexity, exa, jina.\n", .{}),
             ValidationError.InvalidHttpSearchFallbackProvider => std.debug.print("Config error: http_request.search_fallback_providers entries must be valid providers and cannot be 'auto'.\n", .{}),
             ValidationError.InvalidProviderApiMode => std.debug.print("Config error: models.providers.<name>.api_mode must be 'chat_completions' or 'responses'.\n", .{}),
+            ValidationError.InvalidProviderBaseUrl => std.debug.print("Config error: models.providers.<name>.base_url and custom: provider URLs must be absolute http(s) URLs with no query/fragment; plain HTTP is allowed only for localhost/private hosts.\n", .{}),
             ValidationError.InvalidMcpTransport => std.debug.print("Config error: mcp_servers.<name>.transport must be 'stdio' or 'http'.\n", .{}),
             ValidationError.MissingMcpCommand => std.debug.print("Config error: mcp_servers.<name>.command is required when transport='stdio'.\n", .{}),
             ValidationError.MissingMcpHttpUrl => std.debug.print("Config error: mcp_servers.<name>.url is required when transport='http'.\n", .{}),
@@ -5550,6 +5579,60 @@ test "validate rejects invalid provider api_mode" {
     };
 
     try std.testing.expectError(Config.ValidationError.InvalidProviderApiMode, cfg.validate());
+}
+
+test "validate rejects insecure provider base_url and custom urls" {
+    const allocator = std.testing.allocator;
+
+    const remote_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "groq",
+        .default_model = "gpt-4o",
+        .providers = &.{.{
+            .name = "groq",
+            .api_key = "gsk_test",
+            .base_url = "http://api.example.com/v1",
+        }},
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidProviderBaseUrl, remote_cfg.validate());
+
+    const custom_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "custom:http://api.example.com/v1",
+        .default_model = "gpt-4o",
+    };
+    try std.testing.expectError(Config.ValidationError.InvalidProviderBaseUrl, custom_cfg.validate());
+
+    const https_cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "custom:https://api.example.com/v1",
+        .default_model = "gpt-4o",
+    };
+    try https_cfg.validate();
+}
+
+test "validate accepts intentional local provider base_url" {
+    const allocator = std.testing.allocator;
+    const cfg = Config{
+        .workspace_dir = "/tmp/yc",
+        .config_path = "/tmp/yc/config.json",
+        .allocator = allocator,
+        .default_provider = "my-local-llm",
+        .default_model = "gpt-4o",
+        .providers = &.{.{
+            .name = "my-local-llm",
+            .api_key = "key",
+            .base_url = "http://localhost:9999/v1",
+        }},
+    };
+
+    try cfg.validate();
 }
 
 test "providers defaults to empty" {

@@ -333,8 +333,8 @@ pub fn curlStream(
     const log_enabled = verbose.isVerbose();
     const debug_log = std.log.scoped(.sse);
 
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
+    // Build argv on stack (max 40 args)
+    var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -379,6 +379,10 @@ pub fn curlStream(
         argv_buf[argc] = p;
         argc += 1;
     }
+
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     if (auth_header) |auth| {
         argv_buf[argc] = "-H";
@@ -721,8 +725,8 @@ pub fn curlStreamAnthropic(
     callback: root.StreamCallback,
     ctx: *anyopaque,
 ) !root.StreamChatResult {
-    // Build argv on stack (max 32 args)
-    var argv_buf: [32][]const u8 = undefined;
+    // Build argv on stack (max 40 args)
+    var argv_buf: [40][]const u8 = undefined;
     var argc: usize = 0;
 
     argv_buf[argc] = "curl";
@@ -750,6 +754,10 @@ pub fn curlStreamAnthropic(
         argv_buf[argc] = p;
         argc += 1;
     }
+
+    const resolve_entry = try http_util.buildSafeResolveEntryForRemoteUrl(allocator, url);
+    defer if (resolve_entry) |entry| allocator.free(entry);
+    http_util.appendCurlResolveArgs(argv_buf[0..], &argc, resolve_entry);
 
     for (headers) |hdr| {
         argv_buf[argc] = "-H";
