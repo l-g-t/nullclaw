@@ -66,6 +66,20 @@ pub const SkillCandidate = struct {
     has_root_zig: bool = false,
 };
 
+pub fn freeCandidate(allocator: std.mem.Allocator, candidate: *SkillCandidate) void {
+    allocator.free(candidate.result_name);
+    allocator.free(candidate.repo_url);
+    allocator.free(candidate.description);
+    if (candidate.updated_at) |value| allocator.free(value);
+    if (candidate.language) |value| allocator.free(value);
+    if (!std.mem.eql(u8, candidate.owner, "unknown")) allocator.free(candidate.owner);
+    candidate.* = undefined;
+}
+
+pub fn freeCandidates(allocator: std.mem.Allocator, candidates: []SkillCandidate) void {
+    for (candidates) |*candidate| freeCandidate(allocator, candidate);
+}
+
 // ── Scout ────────────────────────────────────────────────────────
 
 /// Scout: search GitHub for nullclaw-compatible skill repositories.

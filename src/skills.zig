@@ -7,6 +7,7 @@ const net_security = @import("net_security.zig");
 const platform = @import("platform.zig");
 const json_miniparse = @import("json_miniparse.zig");
 const observability = @import("observability.zig");
+const skillforge = @import("skillforge.zig");
 
 // Skills — user-defined capabilities loaded from disk.
 //
@@ -1982,9 +1983,79 @@ pub fn installSkillWithDetail(
     return installSkillFromPath(allocator, source, workspace_dir);
 }
 
+pub fn installSkillByNameWithDetail(
+    allocator: std.mem.Allocator,
+    query: []const u8,
+    workspace_dir: []const u8,
+    detail_out: ?*?[]u8,
+) !void {
+    clearInstallErrorDetail(allocator, detail_out);
+
+    const trimmed_query = std.mem.trim(u8, query, " \t\r\n");
+    if (trimmed_query.len == 0) {
+        setInstallErrorDetail(allocator, detail_out, "skill search query must not be empty");
+        return error.SkillNotFound;
+    }
+
+    var candidates = skillforge.scout(allocator, trimmed_query) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "skill registry search failed: {s}", .{@errorName(err)}) catch null;
+        defer if (msg) |value| allocator.free(value);
+        setInstallErrorDetail(allocator, detail_out, msg orelse "skill registry search failed");
+        return err;
+    };
+    defer {
+        skillforge.freeCandidates(allocator, candidates.items);
+        candidates.deinit(allocator);
+    }
+
+    if (candidates.items.len == 0) {
+        setInstallErrorDetail(allocator, detail_out, "no matching skill found in registry");
+        return error.SkillNotFound;
+    }
+
+    const skillforge_cfg = skillforge.SkillForgeConfig{};
+    const candidate = selectBestSkillCandidate(candidates.items, skillforge_cfg.min_score) orelse {
+        setInstallErrorDetail(allocator, detail_out, "no matching skill found in registry");
+        return error.SkillNotFound;
+    };
+
+    const skills_dir = try std.fmt.allocPrint(allocator, "{s}/skills", .{workspace_dir});
+    defer allocator.free(skills_dir);
+
+    const result = skillforge.integrate(allocator, candidate.*, skills_dir) catch |err| {
+        const msg = std.fmt.allocPrint(allocator, "skill integration failed: {s}", .{@errorName(err)}) catch null;
+        defer if (msg) |value| allocator.free(value);
+        setInstallErrorDetail(allocator, detail_out, msg orelse "skill integration failed");
+        return err;
+    };
+
+    if (!result.success) {
+        setInstallErrorDetail(allocator, detail_out, result.error_message orelse "skill integration failed");
+        return error.SkillInstallFailed;
+    }
+}
+
 /// Install a skill from either a local path or a git source URL.
 pub fn installSkill(allocator: std.mem.Allocator, source: []const u8, workspace_dir: []const u8) !void {
     return installSkillWithDetail(allocator, source, workspace_dir, null);
+}
+
+fn selectBestSkillCandidate(
+    candidates: []const skillforge.SkillCandidate,
+    min_score: f64,
+) ?*const skillforge.SkillCandidate {
+    if (candidates.len == 0) return null;
+
+    var best: *const skillforge.SkillCandidate = &candidates[0];
+    var best_score: f64 = -1.0;
+    for (candidates) |*candidate| {
+        const eval = skillforge.evaluateCandidate(candidate.*, min_score);
+        if (eval.total_score > best_score) {
+            best = candidate;
+            best_score = eval.total_score;
+        }
+    }
+    return best;
 }
 
 /// Install a skill by copying its directory into workspace_dir/skills/<source-dirname>/.
@@ -2921,6 +2992,49 @@ test "installSkillWithDetail rejects insecure http source before any network I/O
         error.SkillSecurityAuditFailed,
         installSkillWithDetail(std.testing.allocator, "http://example.com/skill.md", workspace_dir, null),
     );
+}
+
+test "installSkillByNameWithDetail rejects empty query" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const workspace_dir = try @import("compat").fs.Dir.wrap(tmp.dir).realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace_dir);
+
+    var detail: ?[]u8 = null;
+    defer if (detail) |value| std.testing.allocator.free(value);
+
+    try std.testing.expectError(
+        error.SkillNotFound,
+        installSkillByNameWithDetail(std.testing.allocator, "   ", workspace_dir, &detail),
+    );
+    try std.testing.expect(detail != null);
+    try std.testing.expect(std.mem.indexOf(u8, detail.?, "must not be empty") != null);
+}
+
+test "selectBestSkillCandidate prefers the highest score" {
+    const candidates = [_]skillforge.SkillCandidate{
+        .{
+            .result_name = "python-helper",
+            .repo_url = "https://example.com/python-helper",
+            .description = "Python helper",
+            .language = "Python",
+            .owner = "owner-a",
+        },
+        .{
+            .result_name = "zig-skill",
+            .repo_url = "https://example.com/zig-skill",
+            .description = "Zig helper",
+            .language = "Zig",
+            .owner = "owner-b",
+            .has_license = true,
+            .has_build_zig = true,
+        },
+    };
+
+    const cfg = skillforge.SkillForgeConfig{};
+    const best = selectBestSkillCandidate(&candidates, cfg.min_score).?;
+    try std.testing.expectEqualStrings("zig-skill", best.result_name);
 }
 
 test "classifyGitCloneError maps common git clone failures" {

@@ -44,7 +44,7 @@ const Command = enum {
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
 const CONFIG_SUBCOMMANDS = "show|get";
 const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
-const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
+const CHANNEL_SUBCOMMANDS = "list|info|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
 const MEMORY_SUBCOMMANDS = "stats|count|reindex|search|get|list|drain-outbox|forget";
@@ -677,7 +677,8 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             \\Usage: nullclaw channel <{s}> [args]
             \\
             \\Commands:
-            \\  list                          List configured channels
+            \\  list [--json]                 List configured channels
+            \\  info <type> [--json]          Show details for a channel type
             \\  start [channel]               Start a channel (default: first available)
             \\  status                        Show channel health/status
             \\  add <type> <config_json>      Add a channel
@@ -688,19 +689,97 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
     }
 
     const subcmd = sub_args[0];
+    const wants_json = hasJsonFlag(sub_args[1..]);
 
     var cfg = yc.config.Config.load(allocator) catch {
+        if (wants_json) writeJsonError("config_not_found", "No config found -- run `nullclaw onboard` first", null);
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std_compat.process.exit(1);
     };
     defer cfg.deinit();
 
     if (std.mem.eql(u8, subcmd, "list")) {
-        std.debug.print("Configured channels:\n", .{});
-        for (yc.channel_catalog.known_channels) |meta| {
-            var status_buf: [64]u8 = undefined;
-            const status_text = yc.channel_catalog.statusText(&cfg, meta, &status_buf);
-            std.debug.print("  {s}: {s}\n", .{ meta.label, status_text });
+        if (wants_json) {
+            const snapshot = yc.health.snapshot(allocator) catch |err| {
+                writeJsonError("channel_health_failed", "Failed to read channel health", null);
+                std.debug.print("Failed to read channel health: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer snapshot.deinit(allocator);
+
+            const items = yc.channel_admin.collectConfiguredChannels(allocator, &cfg.channels, snapshot) catch |err| {
+                writeJsonError("channel_list_failed", "Failed to build channel list", null);
+                std.debug.print("Failed to build channel list: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer allocator.free(items);
+
+            const rendered = std.json.Stringify.valueAlloc(allocator, items, .{
+                .emit_null_optional_fields = false,
+            }) catch |err| {
+                writeJsonError("channel_list_failed", "Failed to render channel list", null);
+                std.debug.print("Failed to render channel list: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer allocator.free(rendered);
+
+            printStdoutBytes(rendered);
+            printStdoutBytes("\n");
+        } else {
+            std.debug.print("Configured channels:\n", .{});
+            for (yc.channel_catalog.known_channels) |meta| {
+                var status_buf: [64]u8 = undefined;
+                const status_text = yc.channel_catalog.statusText(&cfg, meta, &status_buf);
+                std.debug.print("  {s}: {s}\n", .{ meta.label, status_text });
+            }
+        }
+    } else if (std.mem.eql(u8, subcmd, "info")) {
+        if (sub_args.len < 2) {
+            std.debug.print("Usage: nullclaw channel info <type> [--json]\n", .{});
+            std_compat.process.exit(1);
+        }
+
+        const snapshot = yc.health.snapshot(allocator) catch |err| {
+            if (hasJsonFlag(sub_args[2..])) writeJsonError("channel_health_failed", "Failed to read channel health", null);
+            std.debug.print("Failed to read channel health: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        };
+        defer snapshot.deinit(allocator);
+
+        var detail = yc.channel_admin.readChannelTypeDetail(allocator, &cfg.channels, snapshot, sub_args[1]) catch |err| {
+            if (hasJsonFlag(sub_args[2..])) writeJsonError("channel_detail_failed", "Failed to read channel detail", null);
+            std.debug.print("Failed to read channel detail: {s}\n", .{@errorName(err)});
+            std_compat.process.exit(1);
+        } orelse {
+            if (hasJsonFlag(sub_args[2..])) writeJsonError("channel_type_not_found", "Unknown channel type", null);
+            std.debug.print("Unknown channel type: {s}\n", .{sub_args[1]});
+            std_compat.process.exit(1);
+        };
+        defer detail.deinit(allocator);
+
+        if (hasJsonFlag(sub_args[2..])) {
+            const rendered = std.json.Stringify.valueAlloc(allocator, detail, .{
+                .emit_null_optional_fields = false,
+            }) catch |err| {
+                writeJsonError("channel_detail_failed", "Failed to render channel detail", null);
+                std.debug.print("Failed to render channel detail: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            defer allocator.free(rendered);
+
+            printStdoutBytes(rendered);
+            printStdoutBytes("\n");
+        } else {
+            std.debug.print("Channel: {s}\n", .{detail.type});
+            std.debug.print("  Status: {s}\n", .{detail.status});
+            if (detail.accounts.len == 0) {
+                std.debug.print("  Accounts: (none configured)\n", .{});
+            } else {
+                std.debug.print("  Accounts:\n", .{});
+                for (detail.accounts) |account| {
+                    std.debug.print("    - {s}\n", .{account.account_id});
+                }
+            }
         }
     } else if (std.mem.eql(u8, subcmd, "start")) {
         try runChannelStart(allocator, sub_args[1..]);
@@ -748,6 +827,7 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\Commands:
             \\  list [--json]                 List installed skills
             \\  install <source>              Install from GitHub URL or path
+            \\  install --name <query>        Search registry and install best match
             \\  remove <name>                 Remove a skill
             \\  info <name> [--json]          Show skill details
             \\
@@ -805,19 +885,62 @@ fn runSkills(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
         }
     } else if (std.mem.eql(u8, subcmd, "install")) {
         if (sub_args.len < 2) {
-            std.debug.print("Usage: nullclaw skills install <source>\n", .{});
+            std.debug.print("Usage: nullclaw skills install <source> | --name <query>\n", .{});
+            std_compat.process.exit(1);
+        }
+        var install_name: ?[]const u8 = null;
+        var direct_source: ?[]const u8 = null;
+        var i: usize = 1;
+        while (i < sub_args.len) : (i += 1) {
+            const arg = sub_args[i];
+            if (std.mem.eql(u8, arg, "--name")) {
+                if (i + 1 >= sub_args.len) {
+                    std.debug.print("Usage: nullclaw skills install --name <query>\n", .{});
+                    std_compat.process.exit(1);
+                }
+                if (install_name != null or direct_source != null) {
+                    std.debug.print("Provide only one install target.\n", .{});
+                    std_compat.process.exit(1);
+                }
+                install_name = sub_args[i + 1];
+                i += 1;
+                continue;
+            }
+            if (std.mem.startsWith(u8, arg, "--")) {
+                std.debug.print("Unknown skills install option: {s}\n", .{arg});
+                std_compat.process.exit(1);
+            }
+            if (direct_source != null or install_name != null) {
+                std.debug.print("Provide only one install target.\n", .{});
+                std_compat.process.exit(1);
+            }
+            direct_source = arg;
+        }
+        if (install_name == null and direct_source == null) {
+            std.debug.print("Usage: nullclaw skills install <source> | --name <query>\n", .{});
             std_compat.process.exit(1);
         }
         var install_error_detail: ?[]u8 = null;
         defer if (install_error_detail) |msg| allocator.free(msg);
-        yc.skills.installSkillWithDetail(allocator, sub_args[1], cfg.workspace_dir, &install_error_detail) catch |err| {
+        if (install_name) |query| {
+            yc.skills.installSkillByNameWithDetail(allocator, query, cfg.workspace_dir, &install_error_detail) catch |err| {
+                if (install_error_detail) |msg| {
+                    std.debug.print("{s}\n", .{msg});
+                }
+                std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
+                std_compat.process.exit(1);
+            };
+            std.debug.print("Skill installed from registry search: {s}\n", .{query});
+            return;
+        }
+        yc.skills.installSkillWithDetail(allocator, direct_source.?, cfg.workspace_dir, &install_error_detail) catch |err| {
             if (install_error_detail) |msg| {
                 std.debug.print("{s}\n", .{msg});
             }
             std.debug.print("Failed to install skill: {s}\n", .{@errorName(err)});
             std_compat.process.exit(1);
         };
-        std.debug.print("Skill installed from: {s}\n", .{sub_args[1]});
+        std.debug.print("Skill installed from: {s}\n", .{direct_source.?});
     } else if (std.mem.eql(u8, subcmd, "remove")) {
         if (sub_args.len < 2) {
             std.debug.print("Usage: nullclaw skills remove <name>\n", .{});
