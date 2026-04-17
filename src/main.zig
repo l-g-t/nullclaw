@@ -795,7 +795,7 @@ fn runChannel(allocator: std.mem.Allocator, sub_args: []const []const u8) !void 
             } else {
                 std.debug.print("  Accounts:\n", .{});
                 for (detail.accounts) |account| {
-                    std.debug.print("    - {s}\n", .{account.account_id});
+                    std.debug.print("    - {s} [{s}]\n", .{ account.account_id, account.status });
                 }
             }
         }

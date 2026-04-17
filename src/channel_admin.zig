@@ -12,6 +12,7 @@ pub const ChannelAccountSummary = struct {
 pub const ChannelAccountDetail = struct {
     account_id: []const u8,
     configured: bool = true,
+    status: []const u8,
 };
 
 pub const ChannelTypeDetail = struct {
@@ -92,12 +93,13 @@ pub fn readChannelTypeDetail(
             for (slice) |item| {
                 try accounts.append(allocator, .{
                     .account_id = accountId(item),
+                    .status = healthStatus(snapshot, componentName(entry.type_name, item)),
                 });
             }
 
             return .{
                 .type = entry.type_name,
-                .status = healthStatus(snapshot, entry.type_name),
+                .status = aggregateDetailStatus(accounts.items),
                 .accounts = try accounts.toOwnedSlice(allocator),
             };
         }
@@ -148,12 +150,13 @@ pub fn readChannelTypeDetailFromRuntimeStatusJson(
             for (slice) |item| {
                 try accounts.append(allocator, .{
                     .account_id = accountId(item),
+                    .status = runtimeHealthStatus(parsed.value, componentName(entry.type_name, item)),
                 });
             }
 
             return .{
                 .type = entry.type_name,
-                .status = runtimeHealthStatus(parsed.value, entry.type_name),
+                .status = aggregateDetailStatus(accounts.items),
                 .accounts = try accounts.toOwnedSlice(allocator),
             };
         }
@@ -166,14 +169,14 @@ fn appendChannelAccounts(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(ChannelAccountSummary),
     slice: anytype,
-    type_name: []const u8,
+    comptime type_name: []const u8,
     snapshot: health.HealthSnapshot,
 ) !void {
     for (slice) |item| {
         try items.append(allocator, .{
             .type = type_name,
             .account_id = accountId(item),
-            .status = healthStatus(snapshot, type_name),
+            .status = healthStatus(snapshot, componentName(type_name, item)),
         });
     }
 }
@@ -182,14 +185,14 @@ fn appendChannelAccountsFromRuntimeStatusJson(
     allocator: std.mem.Allocator,
     items: *std.ArrayList(ChannelAccountSummary),
     slice: anytype,
-    type_name: []const u8,
+    comptime type_name: []const u8,
     root: std.json.Value,
 ) !void {
     for (slice) |item| {
         try items.append(allocator, .{
             .type = type_name,
             .account_id = accountId(item),
-            .status = runtimeHealthStatus(root, type_name),
+            .status = runtimeHealthStatus(root, componentName(type_name, item)),
         });
     }
 }
@@ -201,9 +204,23 @@ fn accountId(item: anytype) []const u8 {
     return "default";
 }
 
+fn componentName(comptime type_name: []const u8, item: anytype) []const u8 {
+    if (comptime std.mem.eql(u8, type_name, "external")) {
+        return nonEmptyOrDefault(item.runtime_name, type_name);
+    }
+    if (comptime std.mem.eql(u8, type_name, "maixcam")) {
+        return nonEmptyOrDefault(item.name, type_name);
+    }
+    return type_name;
+}
+
+fn nonEmptyOrDefault(value: []const u8, fallback: []const u8) []const u8 {
+    return if (std.mem.trim(u8, value, " \t\r\n").len > 0) value else fallback;
+}
+
 fn healthStatus(snapshot: health.HealthSnapshot, type_name: []const u8) []const u8 {
     for (snapshot.components) |entry| {
-        if (std.mem.eql(u8, entry.name, type_name)) return entry.health.status;
+        if (std.mem.eql(u8, entry.name, type_name)) return canonicalStatus(entry.health.status);
     }
     return "unknown";
 }
@@ -229,6 +246,16 @@ fn runtimeHealthStatus(root: std.json.Value, type_name: []const u8) []const u8 {
     if (component != .object) return "unknown";
     const status = component.object.get("status") orelse return "unknown";
     return if (status == .string and status.string.len > 0) canonicalStatus(status.string) else "unknown";
+}
+
+fn aggregateDetailStatus(accounts: []const ChannelAccountDetail) []const u8 {
+    if (accounts.len == 0) return "unknown";
+
+    const first = accounts[0].status;
+    for (accounts[1..]) |account| {
+        if (!std.mem.eql(u8, account.status, first)) return "degraded";
+    }
+    return first;
 }
 
 test "collectConfiguredChannels reports configured accounts and health by type" {
@@ -336,4 +363,65 @@ test "readChannelTypeDetailFromRuntimeStatusJson uses live component status" {
     try std.testing.expectEqualStrings("ok", detail.status);
     try std.testing.expectEqual(@as(usize, 1), detail.accounts.len);
     try std.testing.expectEqualStrings("main", detail.accounts[0].account_id);
+    try std.testing.expectEqualStrings("ok", detail.accounts[0].status);
+}
+
+test "channel admin resolves dynamic runtime names from snapshot" {
+    const allocator = std.testing.allocator;
+    const maixcam_accounts = [_]config_types.MaixCamConfig{
+        .{ .account_id = "cam-a", .name = "vision-a" },
+        .{ .account_id = "cam-b", .name = "vision-b" },
+    };
+    const external_accounts = [_]config_types.ExternalChannelConfig{
+        .{ .account_id = "plugin-a", .runtime_name = "plugin_chat_a" },
+        .{ .account_id = "plugin-b", .runtime_name = "plugin_chat_b" },
+    };
+    const channels = config_types.ChannelsConfig{
+        .maixcam = &maixcam_accounts,
+        .external = &external_accounts,
+    };
+
+    health.reset();
+    health.markComponentOk("vision-a");
+    health.markComponentError("vision-b", "camera offline");
+    health.markComponentOk("plugin_chat_a");
+    health.markComponentError("plugin_chat_b", "rpc failed");
+
+    const snapshot = try health.snapshot(allocator);
+    defer snapshot.deinit(allocator);
+
+    const items = try collectConfiguredChannels(allocator, &channels, snapshot);
+    defer allocator.free(items);
+
+    try std.testing.expectEqual(@as(usize, 4), items.len);
+    try std.testing.expectEqualStrings("ok", items[0].status);
+    try std.testing.expectEqualStrings("error", items[1].status);
+    try std.testing.expectEqualStrings("ok", items[2].status);
+    try std.testing.expectEqualStrings("error", items[3].status);
+}
+
+test "channel admin detail degrades mixed dynamic runtime statuses" {
+    const allocator = std.testing.allocator;
+    const maixcam_accounts = [_]config_types.MaixCamConfig{
+        .{ .account_id = "cam-a", .name = "vision-a" },
+        .{ .account_id = "cam-b", .name = "vision-b" },
+    };
+    const channels = config_types.ChannelsConfig{
+        .maixcam = &maixcam_accounts,
+    };
+
+    const runtime_status_json =
+        \\{"version":"1.0.0","pid":1234,"uptime_seconds":42,"overall_status":"degraded","components":{"vision-a":{"status":"ok"},"vision-b":{"status":"error"}}}
+    ;
+
+    var detail = (try readChannelTypeDetailFromRuntimeStatusJson(allocator, &channels, runtime_status_json, "maixcam")).?;
+    defer detail.deinit(allocator);
+
+    try std.testing.expectEqualStrings("maixcam", detail.type);
+    try std.testing.expectEqualStrings("degraded", detail.status);
+    try std.testing.expectEqual(@as(usize, 2), detail.accounts.len);
+    try std.testing.expectEqualStrings("cam-a", detail.accounts[0].account_id);
+    try std.testing.expectEqualStrings("ok", detail.accounts[0].status);
+    try std.testing.expectEqualStrings("cam-b", detail.accounts[1].account_id);
+    try std.testing.expectEqualStrings("error", detail.accounts[1].status);
 }
