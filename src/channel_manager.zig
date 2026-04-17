@@ -96,6 +96,7 @@ pub const ChannelManager = struct {
         return switch (state) {
             .telegram => |ls| ls.last_activity.load(.acquire),
             .signal => |ls| ls.last_activity.load(.acquire),
+            .weixin => |ls| ls.last_activity.load(.acquire),
             .matrix => |ls| ls.last_activity.load(.acquire),
             .max => |ls| ls.last_activity.load(.acquire),
         };
@@ -105,6 +106,7 @@ pub const ChannelManager = struct {
         switch (state) {
             .telegram => |ls| ls.stop_requested.store(true, .release),
             .signal => |ls| ls.stop_requested.store(true, .release),
+            .weixin => |ls| ls.stop_requested.store(true, .release),
             .matrix => |ls| ls.stop_requested.store(true, .release),
             .max => |ls| ls.stop_requested.store(true, .release),
         }
@@ -114,6 +116,7 @@ pub const ChannelManager = struct {
         switch (state) {
             .telegram => |ls| self.allocator.destroy(ls),
             .signal => |ls| self.allocator.destroy(ls),
+            .weixin => |ls| self.allocator.destroy(ls),
             .matrix => |ls| self.allocator.destroy(ls),
             .max => |ls| self.allocator.destroy(ls),
         }
@@ -488,10 +491,12 @@ pub const ChannelManager = struct {
 // Tests
 // ════════════════════════════════════════════════════════════════════════════
 
-test "PollingState has telegram signal matrix and max variants" {
+test "PollingState has telegram signal weixin matrix and max variants" {
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .telegram)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .signal)));
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .signal)) !=
+        @intFromEnum(@as(std.meta.Tag(PollingState), .weixin)));
+    try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .weixin)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .matrix)));
     try std.testing.expect(@intFromEnum(@as(std.meta.Tag(PollingState), .matrix)) !=
         @intFromEnum(@as(std.meta.Tag(PollingState), .max)));

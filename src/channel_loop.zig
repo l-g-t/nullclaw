@@ -32,6 +32,7 @@ const fs_compat = @import("fs_compat.zig");
 const provider_probe = @import("provider_probe.zig");
 
 const signal = @import("channels/signal.zig");
+const weixin = @import("channels/weixin.zig");
 const matrix = @import("channels/matrix.zig");
 const max_mod = @import("channels/max.zig");
 const channels_mod = @import("channels/root.zig");
@@ -1700,6 +1701,26 @@ pub const SignalLoopState = struct {
 };
 
 // ════════════════════════════════════════════════════════════════════════════
+// WeixinLoopState — shared state between supervisor and polling thread
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const WeixinLoopState = struct {
+    /// Updated after each pollMessages() — epoch seconds.
+    last_activity: Atomic(i64),
+    /// Supervisor sets this to ask the polling thread to stop.
+    stop_requested: Atomic(bool),
+    /// Thread handle for join().
+    thread: ?std.Thread = null,
+
+    pub fn init() WeixinLoopState {
+        return .{
+            .last_activity = Atomic(i64).init(std_compat.time.timestamp()),
+            .stop_requested = Atomic(bool).init(false),
+        };
+    }
+};
+
+// ════════════════════════════════════════════════════════════════════════════
 // runSignalLoop — polling thread function
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1824,6 +1845,104 @@ pub fn runSignalLoop(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// runWeixinLoop — polling thread function
+// ════════════════════════════════════════════════════════════════════════════
+
+pub fn runWeixinLoop(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    loop_state: *WeixinLoopState,
+    wx_ptr: *weixin.WeixinChannel,
+) void {
+    loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+
+    var evict_counter: u32 = 0;
+
+    while (!loop_state.stop_requested.load(.acquire) and !daemon.isShutdownRequested()) {
+        const messages = wx_ptr.pollMessages(allocator) catch |err| {
+            log.warn("Weixin poll error: {}", .{err});
+            loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+            std_compat.thread.sleep(5 * std.time.ns_per_s);
+            continue;
+        };
+
+        loop_state.last_activity.store(std_compat.time.timestamp(), .release);
+
+        for (messages) |msg| {
+            const reply_target = msg.reply_target orelse msg.sender;
+            setScheduleToolContext(
+                runtime.tools,
+                "weixin",
+                wx_ptr.config.account_id,
+                reply_target,
+                .direct,
+                msg.sender,
+                null,
+            );
+            defer setScheduleToolContext(runtime.tools, null, null, null, null, null, null);
+
+            var key_buf: [192]u8 = undefined;
+            var routed_session_key: ?[]const u8 = null;
+            defer if (routed_session_key) |key| allocator.free(key);
+
+            const session_key = blk: {
+                const route = agent_routing.resolveRouteWithSession(allocator, .{
+                    .channel = "weixin",
+                    .account_id = wx_ptr.config.account_id,
+                    .peer = .{
+                        .kind = .direct,
+                        .id = msg.sender,
+                    },
+                }, config.agent_bindings, config.agents, config.session) catch break :blk std.fmt.bufPrint(&key_buf, "weixin:{s}:{s}", .{ wx_ptr.config.account_id, msg.sender }) catch msg.sender;
+
+                allocator.free(route.main_session_key);
+                routed_session_key = route.session_key;
+                break :blk route.session_key;
+            };
+
+            const conversation_context = buildConversationContext(.{
+                .channel = "weixin",
+                .account_id = wx_ptr.config.account_id,
+                .sender_id = msg.sender,
+                .delivery_chat_id = reply_target,
+                .peer_id = msg.sender,
+                .is_group = false,
+            });
+
+            const reply = runtime.session_mgr.processMessage(session_key, msg.content, conversation_context) catch |err| {
+                logAgentProcessingError(allocator, "Weixin agent error", err);
+                const owned_err_msg = detailedProviderErrorForDisplay(allocator, err) catch null;
+                defer if (owned_err_msg) |owned_msg| allocator.free(owned_msg);
+                const err_msg = owned_err_msg orelse compactAgentErrorMessage(err);
+                wx_ptr.sendMessage(reply_target, err_msg) catch |send_err| log.err("failed to send weixin error reply: {}", .{send_err});
+                continue;
+            };
+            defer allocator.free(reply);
+
+            wx_ptr.sendMessage(reply_target, reply) catch |err| {
+                log.warn("Weixin send error: {}", .{err});
+            };
+        }
+
+        if (messages.len > 0) {
+            for (messages) |msg| {
+                msg.deinit(allocator);
+            }
+            allocator.free(messages);
+        }
+
+        evict_counter += 1;
+        if (evict_counter >= 100) {
+            evict_counter = 0;
+            _ = runtime.session_mgr.evictIdle(config.agent.session_idle_timeout_secs);
+        }
+
+        health.markComponentOk("weixin");
+    }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // MatrixLoopState — shared state between supervisor and polling thread
 // ════════════════════════════════════════════════════════════════════════════
 
@@ -1866,6 +1985,7 @@ pub const MaxLoopState = struct {
 pub const PollingState = union(enum) {
     telegram: *TelegramLoopState,
     signal: *SignalLoopState,
+    weixin: *WeixinLoopState,
     matrix: *MatrixLoopState,
     max: *MaxLoopState,
 };
@@ -1920,6 +2040,30 @@ pub fn spawnSignalPolling(
     return .{
         .thread = thread,
         .state = .{ .signal = sg_ls },
+    };
+}
+
+pub fn spawnWeixinPolling(
+    allocator: std.mem.Allocator,
+    config: *const Config,
+    runtime: *ChannelRuntime,
+    channel: channels_mod.Channel,
+) !PollingSpawnResult {
+    const wx_ls = try allocator.create(WeixinLoopState);
+    errdefer allocator.destroy(wx_ls);
+    wx_ls.* = WeixinLoopState.init();
+
+    const wx_ptr: *weixin.WeixinChannel = @ptrCast(@alignCast(channel.ptr));
+    const thread = try std.Thread.spawn(
+        .{ .stack_size = thread_stacks.SESSION_TURN_STACK_SIZE },
+        runWeixinLoop,
+        .{ allocator, config, runtime, wx_ls, wx_ptr },
+    );
+    wx_ls.thread = thread;
+
+    return .{
+        .thread = thread,
+        .state = .{ .weixin = wx_ls },
     };
 }
 
@@ -2331,6 +2475,29 @@ test "SignalLoopState stop_requested toggle" {
 
 test "SignalLoopState last_activity update" {
     var state = SignalLoopState.init();
+    const before = state.last_activity.load(.acquire);
+    std_compat.thread.sleep(10 * std.time.ns_per_ms);
+    state.last_activity.store(std_compat.time.timestamp(), .release);
+    const after = state.last_activity.load(.acquire);
+    try std.testing.expect(after >= before);
+}
+
+test "WeixinLoopState init defaults" {
+    const state = WeixinLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    try std.testing.expect(state.thread == null);
+    try std.testing.expect(state.last_activity.load(.acquire) > 0);
+}
+
+test "WeixinLoopState stop_requested toggle" {
+    var state = WeixinLoopState.init();
+    try std.testing.expect(!state.stop_requested.load(.acquire));
+    state.stop_requested.store(true, .release);
+    try std.testing.expect(state.stop_requested.load(.acquire));
+}
+
+test "WeixinLoopState last_activity update" {
+    var state = WeixinLoopState.init();
     const before = state.last_activity.load(.acquire);
     std_compat.thread.sleep(10 * std.time.ns_per_ms);
     state.last_activity.store(std_compat.time.timestamp(), .release);

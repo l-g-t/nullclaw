@@ -4,6 +4,7 @@ const channel_loop = @import("channel_loop.zig");
 const channels_root = @import("channels/root.zig");
 const telegram = @import("channels/telegram.zig");
 const signal = @import("channels/signal.zig");
+const weixin = @import("channels/weixin.zig");
 const max_mod = @import("channels/max.zig");
 const agent_routing = @import("agent_routing.zig");
 
@@ -35,6 +36,11 @@ fn signalPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.C
     return std.fmt.allocPrint(allocator, "{s}|{s}", .{ sg_ptr.http_url, sg_ptr.account }) catch null;
 }
 
+fn weixinPollingSourceKey(allocator: std.mem.Allocator, channel: channels_root.Channel) ?[]u8 {
+    const wx_ptr: *const weixin.WeixinChannel = @ptrCast(@alignCast(channel.ptr));
+    return std.fmt.allocPrint(allocator, "{s}|{s}", .{ wx_ptr.config.base_url, wx_ptr.config.token }) catch null;
+}
+
 pub const polling_descriptors = [_]PollingDescriptor{
     .{
         .channel_name = "telegram",
@@ -45,6 +51,11 @@ pub const polling_descriptors = [_]PollingDescriptor{
         .channel_name = "signal",
         .spawn = channel_loop.spawnSignalPolling,
         .source_key = signalPollingSourceKey,
+    },
+    .{
+        .channel_name = "weixin",
+        .spawn = channel_loop.spawnWeixinPolling,
+        .source_key = weixinPollingSourceKey,
     },
     .{
         .channel_name = "matrix",
@@ -362,6 +373,7 @@ pub fn findInboundRouteDescriptor(config: *const Config, channel_name: []const u
 test "findPollingDescriptor returns known polling adapters" {
     try std.testing.expect(findPollingDescriptor("telegram") != null);
     try std.testing.expect(findPollingDescriptor("signal") != null);
+    try std.testing.expect(findPollingDescriptor("weixin") != null);
     try std.testing.expect(findPollingDescriptor("matrix") != null);
     try std.testing.expect(findPollingDescriptor("max") != null);
     try std.testing.expect(findPollingDescriptor("discord") == null);

@@ -642,10 +642,11 @@ test "encode produces valid finder patterns" {
 
 test "renderTerminal produces output" {
     const qr = try encode("hello");
-    var buf = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    const writer = buf.writer(testing.allocator);
-    try renderTerminal(&qr, writer);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    try renderTerminal(&qr, &buf_writer.writer);
+    buf = buf_writer.toArrayList();
     try testing.expect(buf.items.len > 0);
     // Should contain newlines
     try testing.expect(std.mem.indexOf(u8, buf.items, "\n") != null);
@@ -681,10 +682,11 @@ test "encode and render weixin-length URL" {
     const qr = try encode(url);
     try testing.expect(qr.size >= 25);
 
-    var buf = std.ArrayListUnmanaged(u8){ .items = &.{}, .capacity = 0 };
+    var buf: std.ArrayListUnmanaged(u8) = .empty;
     defer buf.deinit(testing.allocator);
-    const writer = buf.writer(testing.allocator);
-    try renderTerminal(&qr, writer);
+    var buf_writer: std.Io.Writer.Allocating = .fromArrayList(testing.allocator, &buf);
+    try renderTerminal(&qr, &buf_writer.writer);
+    buf = buf_writer.toArrayList();
     try testing.expect(buf.items.len > 100);
 }
 
